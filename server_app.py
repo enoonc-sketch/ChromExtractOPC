@@ -42,6 +42,18 @@ import chrom_core
 
 __version__ = chrom_core.__version__
 
+
+def _force_utf8_stdout():
+    """Windows 控制台默认编码（如 cp1252）写不下中文会直接崩溃；
+    程序输出大量中文，启动时就把 stdout/stderr 强制切到 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 DEFAULT_CONFIG = {
     "endpoint": "opc.tcp://0.0.0.0:4840/ChromExtract",
     "namespace_uri": "urn:chromextract:opcua",
@@ -516,6 +528,7 @@ def load_config(path):
 
 
 def main(argv=None):
+    _force_utf8_stdout()
     ap = argparse.ArgumentParser(description="色谱提取 OPC UA 服务")
     ap.add_argument("--config", default=None, help="配置文件（默认：程序目录 config.json）")
     ap.add_argument("--gui", action="store_true", help="打开图形监控窗口")

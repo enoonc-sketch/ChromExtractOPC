@@ -15,7 +15,19 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
+def _force_utf8_stdout():
+    """Windows 控制台默认编码（如 cp1252）写不下中文会直接崩溃；
+    程序输出中文，启动时就把 stdout/stderr 强制切到 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 async def main():
+    _force_utf8_stdout()
     endpoint = "opc.tcp://127.0.0.1:4840/ChromExtract/"
     sec = "none"
     cert_dir = "certs"

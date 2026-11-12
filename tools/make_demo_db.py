@@ -8,6 +8,17 @@ import sys
 import math
 
 
+def _force_utf8_stdout():
+    """Windows 控制台默认编码（如 cp1252）写不下中文会直接崩溃；
+    程序输出中文，启动时就把 stdout/stderr 强制切到 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def build_trc(n=1200, sp=0.25, delay=2.0, det_name="FID1", y_title="uV"):
     """按 chrom_core.parse_trc 期望的 BinTrc 格式构造一段谱图。"""
     def cstr(s):
@@ -37,6 +48,7 @@ def build_trc(n=1200, sp=0.25, delay=2.0, det_name="FID1", y_title="uV"):
 
 
 def main(path):
+    _force_utf8_stdout()
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     if os.path.exists(path):
         os.remove(path)
