@@ -1,0 +1,52 @@
+name: Build EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean --onefile --console --name ChromExtractOPC --collect-all asyncua --hidden-import tkinter server_app.py
+
+      - name: Check EXE exists
+        run: |
+          if (-not (Test-Path dist\ChromExtractOPC.exe)) { throw "dist\ChromExtractOPC.exe was not produced" }
+
+      - name: Collect deliverables
+        run: |
+          Copy-Item config.json dist\
+          Copy-Item "启动服务.bat" dist\
+          Copy-Item "使用说明_OPCUA.md" dist\
+
+      - name: Smoke test (list demo data)
+        run: |
+          python tools\make_demo_db.py data\demo_V3.db
+          dist\ChromExtractOPC.exe --list data
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChromExtractOPC-Windows
+          path: dist/
