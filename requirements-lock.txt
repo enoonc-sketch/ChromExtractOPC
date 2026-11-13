@@ -1,0 +1,9 @@
+# 经过完整测试的精确版本（可复现构建）。需要时：pip install -r requirements-lock.txt
+asyncua==2.1.0
+cryptography==50.0.2
+pyinstaller==6.22.3
+aiosqlite==0.22.1
+python-dateutil==2.9.0.post0
+pytz==2026.6
+sortedcontainers==2.4.0
+typing_extensions==4.16.0

@@ -11,5 +11,16 @@
   "cert_dir": "certs",
   "csv_export_dir": "谱图导出",
   "log_file": "logs/server.log",
-  "max_points": 20000
+  "max_points": 20000,
+  "allow_anonymous": true,
+  "users": {},
+  "allow_insecure_fallback": false,
+  "trusted_client_certs_dir": "certs/trusted",
+  "remote_export": true,
+  "export_min_interval_sec": 10,
+  "max_connections": 20,
+  "max_trace_points": 2000000,
+  "max_file_mb": 256,
+  "log_max_mb": 5,
+  "log_backups": 5
 }

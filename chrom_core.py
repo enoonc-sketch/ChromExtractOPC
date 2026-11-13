@@ -8,6 +8,7 @@ chrom_core.py —— 谱图数据解析核心库
 """
 import array
 import csv
+import math
 import os
 import re
 import shutil
@@ -16,11 +17,47 @@ import struct
 import sys
 import tempfile
 
-__version__ = "2.0"
+__version__ = "2.2"
+
+# ---- 输入防护上限：数据文件来自外部，不能假设它是善意、完整的 ----
+MAX_TRACE_POINTS = 2_000_000          # 单条谱图最多采样点数
+MAX_BLOB_BYTES = 32 * 1024 * 1024     # 单条谱图二进制最大字节数
+MAX_FILE_BYTES = 256 * 1024 * 1024    # .mbd 文件最大字节数（整个读入内存）
+MAX_TEXT_LEN = 256                    # 来自数据文件的名称类文本最大长度
+
+
+def set_limits(max_points=None, max_blob_mb=None, max_file_mb=None):
+    """由配置文件覆盖默认上限。"""
+    global MAX_TRACE_POINTS, MAX_BLOB_BYTES, MAX_FILE_BYTES
+    if max_points:
+        MAX_TRACE_POINTS = int(max_points)
+    if max_blob_mb:
+        MAX_BLOB_BYTES = int(max_blob_mb) * 1024 * 1024
+    if max_file_mb:
+        MAX_FILE_BYTES = int(max_file_mb) * 1024 * 1024
 
 
 class TraceError(Exception):
     pass
+
+
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean_text(s, maxlen=None):
+    """去掉控制字符（防日志注入/节点名污染）并限制长度。"""
+    return _CTRL_RE.sub(" ", s)[: (maxlen or MAX_TEXT_LEN)]
+
+
+_CSV_DANGER = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_cell(v):
+    """CSV 公式注入防护：文本以 = + - @ 开头时，Excel 会当公式执行，前面补一个单引号。
+    只处理字符串，数值原样输出。"""
+    if isinstance(v, str) and v.startswith(_CSV_DANGER):
+        return "'" + v
+    return v
 
 
 class _Reader:
@@ -68,15 +105,17 @@ class _Reader:
 def _decode_text(raw):
     for enc in ("utf-8", "gbk"):
         try:
-            return raw.decode(enc)
+            return clean_text(raw.decode(enc))
         except UnicodeDecodeError:
             pass
-    return raw.decode("latin-1", "replace")
+    return clean_text(raw.decode("latin-1", "replace"))
 
 
 def parse_trc(blob):
     """把一段 BinTrc 二进制解码成字典。"""
     blob = bytes(blob)
+    if len(blob) > MAX_BLOB_BYTES:
+        raise TraceError("谱图数据过大：%d 字节（上限 %d）" % (len(blob), MAX_BLOB_BYTES))
     r = _Reader(blob)
     info = {}
     # 1) 头
@@ -89,8 +128,8 @@ def parse_trc(blob):
     info["unit_mult"] = r.f32()
     info["delay"] = r.f32()
     n = r.i32()
-    if n < 0 or r.p + 4 * n > len(blob):
-        raise TraceError("采样点数不合理：%d" % n)
+    if n < 0 or n > MAX_TRACE_POINTS or r.p + 4 * n > len(blob):
+        raise TraceError("采样点数不合理：%d（上限 %d）" % (n, MAX_TRACE_POINTS))
     data = array.array("i")
     data.frombytes(blob[r.p:r.p + 4 * n])
     if sys.byteorder != "little":
@@ -125,15 +164,32 @@ def parse_trc(blob):
     return info
 
 
-def to_series(info, raw_only=False):
-    """返回 (时间秒, 时间显示值, 原始值, 微伏, 显示值) 五个列表。"""
-    sp = info["sample_period"] or info["base_freq"] or 0.0
-    delay = info["delay"] or 0.0
-    um = info["unit_mult"] or 1.0
-    ym = info["y_mult"] or 1.0
-    xm = info["x_mult"] or 1.0
-    raw = list(info["data"])
-    t = [delay + i * sp for i in range(len(raw))] if sp else [float(i) for i in range(len(raw))]
+def _fin(x, default):
+    """非有限数（NaN/Inf）或非法值一律退回默认值，避免污染下游。"""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return default
+    return x if math.isfinite(x) else default
+
+
+def to_series(info, raw_only=False, max_points=None):
+    """返回 (时间秒, 时间显示值, 原始值, 微伏, 显示值) 五个列表。
+    max_points：超过时在展开成列表之前就等间隔抽点，内存占用与点数上限成正比。"""
+    sp = _fin(info["sample_period"], 0.0) or _fin(info["base_freq"], 0.0)
+    delay = _fin(info["delay"], 0.0)
+    um = _fin(info["unit_mult"], 1.0) or 1.0
+    ym = _fin(info["y_mult"], 1.0) or 1.0
+    xm = _fin(info["x_mult"], 1.0) or 1.0
+    data = info["data"]
+    n = len(data)
+    if max_points and n > max_points:
+        step = n / float(max_points)
+        idx = [int(k * step) for k in range(int(max_points))]
+    else:
+        idx = range(n)
+    raw = [data[i] for i in idx]
+    t = [delay + i * sp for i in idx] if sp else [float(i) for i in idx]
     tx = [v * xm for v in t]
     uv = [v * um for v in raw]
     val = [v * ym for v in uv]
@@ -165,18 +221,21 @@ class Item:
 
 def iter_mbd(path):
     """读取 .mbd 谱图文件，返回其中所有的 trc 谱图。"""
+    if os.path.getsize(path) > MAX_FILE_BYTES:
+        raise TraceError("MBD 文件过大：%s" % os.path.basename(path))
     with open(path, "rb") as f:
         buf = f.read()
-    if buf[:4] != b"EZBD":
+    if len(buf) < 16 or buf[:4] != b"EZBD":
         raise TraceError("不是 MBD 谱图文件：%s" % os.path.basename(path))
     count = struct.unpack_from("<i", buf, 12)[0]
-    if count < 0 or 16 + 24 * count > len(buf):
+    if count < 0 or count > 100000 or 16 + 24 * count > len(buf):
         raise TraceError("MBD 文件头损坏")
     for k in range(count):
         o = 16 + 24 * k
         name = buf[o:o + 12].split(b"\x00")[0].decode("latin-1").lower()
         det, size, off = struct.unpack_from("<iii", buf, o + 12)
-        if name == "trc" and size > 0 and off + size <= len(buf):
+        # 偏移必须落在文件内且不能是负数（负数会让切片从文件尾倒着取，读到错误数据）
+        if name == "trc" and 0 < size <= MAX_BLOB_BYTES and off >= 16 and off + size <= len(buf):
             yield Item(source=os.path.basename(path), det=det, blob=buf[off:off + size])
 
 
@@ -188,9 +247,27 @@ def _open_db_copy(path, tmpdir):
     for ext in ("-wal", "-shm"):
         if os.path.exists(path + ext):
             shutil.copy2(path + ext, dst + ext)
+    with open(dst, "rb") as f:
+        if f.read(16) != b"SQLite format 3\x00":
+            raise TraceError("不是 SQLite 数据库：%s" % base)
     con = sqlite3.connect(dst)
     con.text_factory = lambda b: _decode_text(b)
+    # 数据库文件不可信：只读、不信任库内的视图/触发器、只允许 SELECT
+    con.execute("PRAGMA query_only=ON")
+    try:
+        con.execute("PRAGMA trusted_schema=OFF")
+    except sqlite3.Error:
+        pass
+    con.set_authorizer(_authorizer)   # 必须放在上面两条 PRAGMA 之后
     return con
+
+
+_SQL_ALLOWED = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION,
+                getattr(sqlite3, "SQLITE_RECURSIVE", -1)}
+
+
+def _authorizer(action, arg1, arg2, dbname, source):
+    return sqlite3.SQLITE_OK if action in _SQL_ALLOWED else sqlite3.SQLITE_DENY
 
 
 def db_overview(con):
@@ -240,30 +317,49 @@ def iter_db(path, tmpdir, app=None, stream=None, det=None, since=None, until=Non
             for cid, isv, cal in cur.execute("SELECT CycleRowId, IsValidation, CalibrationLevel FROM Cycle"):
                 cyc[cid] = (isv, cal)
 
-        where, args = ["BinTrc IS NOT NULL"], []
-        for col, val in (("ApplicationId", app), ("StreamId", stream), ("DetectorId", det)):
+        # 条件片段全是写死的列名，取值一律走参数绑定（无 SQL 注入面）
+        conds, args = ["BinTrc IS NOT NULL", "length(BinTrc) <= ?"], [MAX_BLOB_BYTES]
+        for clause, val in (("ApplicationId=?", app), ("StreamId=?", stream), ("DetectorId=?", det)):
             if val is not None:
-                where.append("%s=?" % col)
+                conds.append(clause)
                 args.append(val)
         if since:
-            where.append("CycleTime>=?")
+            conds.append("CycleTime>=?")
             args.append(since)
         if until:
-            where.append("CycleTime<=?")
+            conds.append("CycleTime<=?")
             args.append(until + ("z" if len(until) <= 10 else ""))  # 只写日期时，包含当天
-        sql = ("SELECT CycleRowId, ApplicationId, StreamId, DetectorId, CycleTime, BinTrc "
-               "FROM Chromatogram WHERE " + " AND ".join(where) + " ORDER BY CycleRowId DESC")
+        where = " AND ".join(conds)
+        base_cols = "CycleRowId, ApplicationId, StreamId, DetectorId, CycleTime"
+        have_rowid = True
+        try:
+            rows = cur.execute("SELECT rowid, " + base_cols + " FROM Chromatogram WHERE "  # nosec B608
+                               + where + " ORDER BY CycleRowId DESC", args).fetchall()
+        except sqlite3.OperationalError:   # WITHOUT ROWID 表：退回一次性读取
+            have_rowid = False
+            rows = [(None,) + r for r in cur.execute(
+                "SELECT " + base_cols + ", BinTrc FROM Chromatogram WHERE "  # nosec B608
+                + where + " ORDER BY CycleRowId DESC", args).fetchall()]
         seen = {}
         picked = []
-        for cid, a, s, d, ct, blob in cur.execute(sql, args):
+        for row in rows:
+            rid, cid, a, s, d, ct = row[:6]
             if last:
                 cycles = seen.setdefault((a, s), [])
                 if cid not in cycles:
                     if len(cycles) >= last:
                         continue
                     cycles.append(cid)
-            picked.append((cid, a, s, d, ct, blob))
-        for cid, a, s, d, ct, blob in reversed(picked):
+            picked.append(row)
+        for row in reversed(picked):
+            rid, cid, a, s, d, ct = row[:6]
+            if have_rowid:
+                got = cur.execute("SELECT BinTrc FROM Chromatogram WHERE rowid=?", (rid,)).fetchone()
+                blob = got[0] if got else None
+            else:
+                blob = row[6]
+            if blob is None:
+                continue
             isv, cal = cyc.get(cid, (None, None))
             yield Item(source=os.path.basename(path), analyzer=serial, app=a, stream=s, det=d,
                        cycle_id=cid, cycle_time=str(ct), is_validation=isv, cal_level=cal,
@@ -334,25 +430,30 @@ def extract(paths, outdir, last=None, app=None, stream=None, det=None, since=Non
             log("读取：%s" % src)
             gen = iter_mbd(src) if low.endswith(".mbd") else iter_db(src, tmp, app, stream, det,
                                                                      since, until, last)
-            for it in gen:
-                try:
-                    info = parse_trc(it.blob)
-                except TraceError as e:
-                    bad += 1
-                    log("  跳过一条无法解析的谱图（检测器 %s）：%s" % (it.det, e))
-                    continue
-                if not info["data"]:
-                    continue
-                series = to_series(info)
-                label = item_label(it)
-                write_csv(os.path.join(csv_dir, label + ".csv"), info, series)
-                t, tx, raw, uv, val = series
-                index_rows.append([it.source, it.analyzer, it.app, it.app_name, it.stream,
-                                   it.stream_name, it.det, info["det_name"] or info["trace_name"],
-                                   it.cycle_id, it.cycle_time, it.is_validation, it.cal_level,
-                                   len(raw), "%.6g" % (info["sample_period"] or 0),
-                                   "%.6g" % (t[-1] if t else 0), min(raw), max(raw),
-                                   os.path.join("csv", label + ".csv")])
+            try:
+                for it in gen:
+                    try:
+                        info = parse_trc(it.blob)
+                    except TraceError as e:
+                        bad += 1
+                        log("  跳过一条无法解析的谱图（检测器 %s）：%s" % (it.det, e))
+                        continue
+                    if not info["data"]:
+                        continue
+                    series = to_series(info)
+                    label = item_label(it)
+                    write_csv(os.path.join(csv_dir, label + ".csv"), info, series)
+                    t, tx, raw, uv, val = series
+                    index_rows.append([csv_cell(x) for x in (
+                        it.source, it.analyzer, it.app, it.app_name, it.stream,
+                        it.stream_name, it.det, info["det_name"] or info["trace_name"],
+                        it.cycle_id, it.cycle_time, it.is_validation, it.cal_level,
+                        len(raw), "%.6g" % (info["sample_period"] or 0),
+                        "%.6g" % (t[-1] if t else 0), min(raw), max(raw),
+                        os.path.join("csv", label + ".csv"))])
+            except (TraceError, sqlite3.Error, OSError) as e:
+                bad += 1
+                log("  跳过无法读取的数据源 %s：%s" % (src, e))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -375,26 +476,32 @@ def list_sources(paths, log=print):
         for p in find_inputs(paths):
             low = p.lower()
             log("== %s" % p)
-            if low.endswith(".mbd"):
-                items = list(iter_mbd(p))
-                for it in items:
-                    info = parse_trc(it.blob)
-                    dur = len(info["data"]) * (info["sample_period"] or 0)
-                    log("   检测器 %s：%d 个点，采样间隔 %.4g 秒，约 %.1f 秒" % (
-                        it.det, len(info["data"]), info["sample_period"], dur))
-            else:
-                con = _open_db_copy(p, tmp)
-                try:
-                    ov = db_overview(con)
-                finally:
-                    con.close()
-                for sn, name, ver in ov["analyzers"]:
-                    log("   仪器：序列号 %s，名称 %s，软件版本 %s" % (sn, name, ver))
-                if not ov["groups"]:
-                    log("   （没有谱图）")
-                for g in ov["groups"]:
-                    log("   应用 %s %s / 流路 %s %s / 检测器 %s：%d 条谱图（%s ～ %s）" % (
-                        g["app"], g["app_name"], g["stream"], g["stream_name"], g["det"],
-                        g["n"], g["first"], g["last"]))
+            try:
+                _list_one(p, low, tmp, log)
+            except (TraceError, sqlite3.Error, OSError) as e:
+                log("   无法读取：%s" % e)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _list_one(p, low, tmp, log):
+    if low.endswith(".mbd"):
+        for it in iter_mbd(p):
+            info = parse_trc(it.blob)
+            dur = len(info["data"]) * (_fin(info["sample_period"], 0.0))
+            log("   检测器 %s：%d 个点，采样间隔 %.4g 秒，约 %.1f 秒" % (
+                it.det, len(info["data"]), _fin(info["sample_period"], 0.0), dur))
+        return
+    con = _open_db_copy(p, tmp)
+    try:
+        ov = db_overview(con)
+    finally:
+        con.close()
+    for sn, name, ver in ov["analyzers"]:
+        log("   仪器：序列号 %s，名称 %s，软件版本 %s" % (sn, name, ver))
+    if not ov["groups"]:
+        log("   （没有谱图）")
+    for g in ov["groups"]:
+        log("   应用 %s %s / 流路 %s %s / 检测器 %s：%d 条谱图（%s ～ %s）" % (
+            g["app"], g["app_name"], g["stream"], g["stream_name"], g["det"],
+            g["n"], g["first"], g["last"]))

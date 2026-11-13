@@ -40,17 +40,18 @@ async def main():
         cert_dir = args[args.index("--cert") + 1]
 
     from asyncua import Client, ua
-    kwargs = {}
+    client = Client(url=endpoint)
     if sec != "none":
         from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
-        cert = open("%s/server_cert.der" % cert_dir, "rb").read()
-        key = open("%s/server_key.pem" % cert_dir, "rb").read()
-        kwargs["security_policy"] = [SecurityPolicyBasic256Sha256,
-                                     ua.MessageSecurityMode.SignAndEncrypt
-                                     if sec == "sign_encrypt" else ua.MessageSecurityMode.Sign]
-        kwargs["certificate"] = cert
-        kwargs["private_key"] = key
-    async with Client(url=endpoint, **kwargs) as client:
+        # 测试用：直接拿服务端自签名证书兼作客户端证书（应用 URI 需与证书一致）
+        client.application_uri = "urn:chromextract:opcua:server"
+        await client.set_security(
+            SecurityPolicyBasic256Sha256,
+            certificate="%s/server_cert.der" % cert_dir,
+            private_key="%s/server_key.pem" % cert_dir,
+            mode=(ua.MessageSecurityMode.SignAndEncrypt if sec == "sign_encrypt"
+                  else ua.MessageSecurityMode.Sign))
+    async with client:
         ns = await client.get_namespace_index("urn:chromextract:opcua")
         root = await client.nodes.objects.get_child(["%s:Chromatograph" % ns])
         print("已连接：%s" % endpoint)
