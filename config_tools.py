@@ -173,3 +173,24 @@ def harden(path, username, password):
     data["users"] = users
     write_atomic(path, data)
     return changes
+
+
+def set_watch_dirs(path, dirs):
+    """把监控目录改成给定的文件夹（可多个）。目录必须真实存在；保存为绝对路径。
+    返回保存后的列表。只改 watch_dirs 这一项。"""
+    cleaned = []
+    for d in dirs:
+        d = (d or "").strip().strip('"').strip()
+        if not d:
+            continue
+        d = os.path.abspath(os.path.expanduser(d))
+        if not os.path.isdir(d):
+            raise ConfigToolError("找不到这个文件夹：%s\n请检查路径是否输入正确（可以在资源管理器地址栏复制）。" % d)
+        if d not in cleaned:
+            cleaned.append(d)
+    if not cleaned:
+        raise ConfigToolError("没有给出有效的文件夹路径。")
+    data = read_raw(path)
+    data["watch_dirs"] = cleaned
+    write_atomic(path, data)
+    return cleaned

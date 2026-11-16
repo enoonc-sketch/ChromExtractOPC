@@ -19,6 +19,10 @@
 | `config.json` | 配置文件（端口、监控目录、扫描周期、安全模式等） |
 | `build_exe.bat` | **一键打包为 EXE**（在有 Python 的电脑上运行一次即可） |
 | `启动服务.bat` | 启动服务（优先用打包好的 EXE，其次用 Python 源码运行） |
+| `启动图形界面.bat` | 以图形窗口方式启动（自动隐藏黑色命令行窗口） |
+| `安装.bat` / `卸载.bat` | **一键安装 / 卸载**（自检 → 复制到 C:\ChromExtractOPC → 设数据目录 → 防火墙 → 开机自启 → 启动） |
+| `安装开机自启.bat`、`install_autostart.ps1` | 只设置开机自启（不限时运行，崩溃后自动重启） |
+| `demo_data.py` | 演示数据生成（打包进 EXE，供 `--selftest` 自检使用） |
 | `requirements.txt` | 依赖清单 |
 | `tools\make_demo_db.py` | 生成演示数据库，用于验收测试 |
 | `tools\opcua_test_client.py` | OPC UA 验收测试客户端 |
@@ -28,18 +32,25 @@
 
 **第 1 步：打包 EXE**（在一台装了 Python 3.10+ 的电脑上，只需做一次）
 
-1. 双击 `build_exe.bat`，等待出现"打包完成"。
-2. 产物在 `dist\` 文件夹：`ChromExtractOPC.exe` + `config.json`。
+1. 双击 `build_exe.bat`，等待出现"打包完成，自检通过"。脚本会在打包后**真的启动一次服务并用客户端读取演示数据**，
+   自检不通过就不会宣布成功，避免拿到一个不能用的 EXE。
+2. 产物在 `dist\` 文件夹，里面已经包含 EXE、配置、安装/卸载脚本、防火墙脚本等全部文件。
 
 **第 2 步：部署到现场电脑**
 
-1. 把 `dist` 文件夹整个拷贝到现场电脑（例如 `D:\ChromExtractOPC\`）。
-2. 编辑同目录的 `config.json`，把 `watch_dirs` 改成实际的日志数据库所在目录，例如：
+1. 把 `dist` 文件夹**整个**拷贝到现场电脑（不要只拷 EXE）。
+2. 右键 `安装.bat` → **以管理员身份运行**，按提示操作：
+   - 先自动自检，确认程序在这台电脑上能运行；
+   - 输入色谱数据所在文件夹（存放 `*_V3.db` / `.mbd` 的目录），程序会写进配置并告诉你找到了几个数据文件；
+   - 输入允许访问的客户端地址（防火墙，可跳过）；
+   - 设置开机自启并立即启动。
+3. 想先试一下、不安装：双击 `ChromExtractOPC.exe`，或双击 `启动图形界面.bat`。
+   出错时窗口会停住显示原因，不会一闪而过。
+4. 手动改配置的话，编辑 `config.json` 的 `watch_dirs`（路径里的反斜杠要写两个）：
    ```json
    "watch_dirs": ["D:\\GCP\\DataBrowser"]
    ```
-3. 双击 `ChromExtractOPC.exe` 启动。窗口显示 `OPC UA 服务已启动：opc.tcp://0.0.0.0:4840/ChromExtract` 即成功。
-4. Windows 防火墙首次弹窗时选择"允许访问"。
+   或者用命令：`ChromExtractOPC.exe --set-watch-dir "D:\GCP\DataBrowser"`。
 
 **第 3 步：验收**
 
@@ -116,19 +127,20 @@ Chromatograph
   （把 `certs\server_cert.der` 导入客户端的受信任证书库）。
 - 更严格的场合可由企业 CA 签发证书后替换 `certs\` 下的文件。
 
-## 6. 开机自启（两种方式任选）
+## 6. 开机自启
 
-**方式 A：任务计划程序（推荐，最简单）**，管理员命令行执行：
+**推荐：`安装.bat`（或只设自启：右键 `安装开机自启.bat` 以管理员身份运行）。**
 
-```
-schtasks /Create /TN "ChromExtractOPC" /TR "D:\ChromExtractOPC\ChromExtractOPC.exe" /SC ONSTART /RU SYSTEM
-```
+- 任务设为**运行时间不限**，程序异常退出后 **1 分钟自动重启**。
+  （注意：用 `schtasks /Create` 手工创建的任务，Windows 默认会在运行满 72 小时后强制结束它，服务会莫名停掉，所以不要手工创建。）
+- 可选以当前账号运行（更安全，需 Windows 密码）或 SYSTEM 账号运行（不需要密码）。
+- 卸载：`卸载.bat`，或 `安装开机自启.bat remove`。
 
-**方式 B：NSSM 注册为 Windows 服务**
+**备选：NSSM 注册为 Windows 服务**
 
 1. 下载 NSSM（https://nssm.cc），执行：
    ```
-   nssm install ChromExtractOPC D:\ChromExtractOPC\ChromExtractOPC.exe
+   nssm install ChromExtractOPC C:\ChromExtractOPC\ChromExtractOPC.exe
    nssm start ChromExtractOPC
    ```
 2. 卸载服务：`nssm remove ChromExtractOPC confirm`。
@@ -154,7 +166,10 @@ ChromExtractOPC.exe --gui                      :: 打开图形监控窗口
 | 客户端连不上 | 检查防火墙是否放行 4840；`netstat -ano | findstr 4840` 确认在监听 |
 | 端口被占用 | 改 `config.json` 的 `endpoint` 端口（如 4841），客户端同步修改 |
 | 看不到数据 | 确认 `watch_dirs` 路径正确且包含 `*_V3.db` 或 `*.mbd`；查看 `logs\server.log` |
-| 改了 config 不生效 | 重启程序（配置只在启动时读取） |
+| 改了 config 不生效 | 账号、匿名开关、监控目录、扫描间隔等会在下一轮扫描内自动生效；端口、加密方式、证书需重启 |
+| 不确定 EXE 本身有没有问题 | 命令行运行 `ChromExtractOPC.exe --selftest`：通过说明程序正常，问题在配置/网络/防火墙 |
+| 双击 EXE 窗口一闪就没了 | 新版出错时会停住并显示原因；日志在 `logs\server.log`，未预期的崩溃记在 `logs\crash.log` |
+| 杀毒软件删了 EXE / 提示危险 | PyInstaller 打包的程序常被误报。把程序文件夹加入白名单后重新打包；`安装.bat` 的自检能发现文件被破坏 |
 | 加密模式客户端报证书错误 | 把 `certs\server_cert.der` 导入客户端受信任列表，或先用 `none` 模式排通 |
 
 ## 9. 从源码重新打包 / 开发调试
@@ -162,6 +177,7 @@ ChromExtractOPC.exe --gui                      :: 打开图形监控窗口
 - 源码模式直接运行：`python server_app.py`（需 `pip install -r requirements.txt`）。
 - 重新打包：再次双击 `build_exe.bat`。
 - 生成测试数据：`python tools\make_demo_db.py data\demo_V3.db`。
+- 验证打包结果：`ChromExtractOPC.exe --selftest`（在临时目录起真实服务并读取，不影响现有配置）。
 
 ---
 

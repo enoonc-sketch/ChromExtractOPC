@@ -1,75 +1,90 @@
 @echo off
 chcp 65001 >nul
+setlocal
 cd /d "%~dp0"
+
+rem ---- 找一个真正能用的 Python 3.10+（Microsoft Store 的假 python.exe 会被自动排除）----
+set "PY="
+py -3 -c "import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)" >nul 2>nul && set "PY=py -3"
+if not defined PY python -c "import sys; sys.exit(0 if sys.version_info>=(3,10) else 1)" >nul 2>nul && set "PY=python"
+if not defined PY goto :nopy
+
+set "VER=?"
+for /f "delims=" %%v in ('%PY% -c "import chrom_core; print(chrom_core.__version__)"') do set "VER=%%v"
+
 echo ============================================
 echo   色谱提取 OPC UA 服务 —— 一键打包为 EXE
-echo   ChromExtractOPC v2.0
+echo   ChromExtractOPC v%VER%
 echo ============================================
 echo.
-
-where py >nul 2>nul && (set "PY=py -3" & goto :havepy)
-where python >nul 2>nul && (set "PY=python" & goto :havepy)
-echo 没有找到 Python 3。请先安装 Python 3.10 以上版本：
-echo   https://www.python.org/downloads/
-echo 安装时务必勾选 "Add python.exe to PATH"，然后重新双击本文件。
-pause
-exit /b 1
-
-:havepy
-echo 找到 Python：
+echo 使用的 Python：
 %PY% --version
-%PY% -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >nul 2>nul
-if errorlevel 1 (
-  echo Python 版本过低，需要 3.10 以上。请升级 Python 后再试。
-  pause
-  exit /b 1
-)
+echo.
 
 if exist build_env\Scripts\python.exe (
-  echo [1/3] 已有构建环境 build_env，直接复用...
+  echo [1/4] 已有构建环境 build_env，直接复用...
 ) else (
-  echo [1/3] 创建独立构建环境（build_env）...
+  echo [1/4] 创建独立构建环境 build_env ...
   %PY% -m venv build_env
   if errorlevel 1 goto :fail
 )
 
-echo [2/3] 安装依赖（asyncua / cryptography / pyinstaller）...
-build_env\Scripts\python -m pip install --upgrade pip -q
+echo [2/4] 安装依赖 asyncua / cryptography / pyinstaller ...
+build_env\Scripts\python -m pip install --disable-pip-version-check --upgrade pip -q
 if errorlevel 1 goto :fail
-build_env\Scripts\pip install -r requirements.txt -q
+build_env\Scripts\python -m pip install --disable-pip-version-check -r requirements.txt -q
 if errorlevel 1 goto :fail
 
-echo [3/3] 使用 PyInstaller 打包（首次打包约需 1~3 分钟）...
-build_env\Scripts\pyinstaller --noconfirm --clean --onefile --console ^
+echo [3/4] 使用 PyInstaller 打包（首次约需 1 到 3 分钟）...
+if exist dist\ChromExtractOPC.exe del /q dist\ChromExtractOPC.exe
+build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --console --noupx ^
   --name ChromExtractOPC ^
   --collect-all asyncua ^
   --hidden-import tkinter ^
+  --hidden-import demo_data ^
   server_app.py
 if errorlevel 1 goto :fail
+if not exist dist\ChromExtractOPC.exe goto :fail
 
-if not exist dist\ChromExtractOPC.exe (
-  echo 打包失败：未生成 dist\ChromExtractOPC.exe，请把上面的报错截图或复制下来寻求支持。
-  pause
-  exit /b 1
+echo [4/4] 验证打包结果（自检约需 10 秒）...
+dist\ChromExtractOPC.exe --version
+if errorlevel 1 goto :badexe
+dist\ChromExtractOPC.exe --selftest
+if errorlevel 1 goto :badexe
+
+rem ---- 组装发布文件夹：这些文件缺一个，目标电脑上对应功能就用不了 ----
+if not exist dist\config.json copy /y config.json dist\ >nul
+for %%f in ("安装.bat" "卸载.bat" "启动服务.bat" "启动图形界面.bat" "安装开机自启.bat" "install_autostart.ps1" "设置防火墙.bat" "安全管理.bat" "使用说明_OPCUA.md" "安全检查报告.md") do (
+  if exist "%%~f" copy /y "%%~f" dist\ >nul
 )
 
-copy /y config.json dist\ >nul
-copy /y "启动服务.bat" dist\ >nul
-copy /y "使用说明_OPCUA.md" dist\ >nul
 echo.
 echo ============================================
-echo   打包完成！
-echo   程序：dist\ChromExtractOPC.exe
-echo   配置：dist\config.json（部署前按实际目录改 watch_dirs）
-echo   启动：dist\启动服务.bat
-echo   使用：把 dist 文件夹整个拷到目标电脑，
-echo         双击 ChromExtractOPC.exe 即可启动 OPC UA 服务
+echo   打包完成，自检通过。
+echo   把整个 dist 文件夹拷到目标电脑，右键
+echo   "安装.bat" 选择"以管理员身份运行"即可。
+echo   （只想试一下：双击 ChromExtractOPC.exe）
 echo ============================================
 pause
 exit /b 0
 
+:nopy
+echo 没有找到可用的 Python 3.10 以上版本。
+echo 请安装： https://www.python.org/downloads/
+echo 安装时务必勾选 "Add python.exe to PATH"，然后重新双击本文件。
+pause
+exit /b 1
+
+:badexe
+echo.
+echo 打包出了 EXE，但自检没通过，这个 EXE 不能用。
+echo 请把上面的文字截图或复制给技术支持。
+echo 如果提示被拦截或文件消失，多半是杀毒软件误删，请把本文件夹加入白名单后重新打包。
+pause
+exit /b 1
+
 :fail
 echo.
-echo 打包失败，请把上面的报错信息截图或复制下来寻求支持。
+echo 打包失败，请把上面的报错信息截图或复制给技术支持。
 pause
 exit /b 1

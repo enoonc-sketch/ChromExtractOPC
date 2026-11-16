@@ -927,6 +927,7 @@ def security_summary(cfg):
 def run_gui(cfg):
     import tkinter as tk
     from tkinter import scrolledtext
+    _hide_own_console()
 
     root = tk.Tk()
     root.title("色谱提取 OPC UA 服务 v%s" % __version__)
@@ -1000,6 +1001,152 @@ def run_gui(cfg):
         except RuntimeError:
             pass
     worker_done.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Windows 控制台辅助：双击 EXE 时别让错误一闪而过
+# ---------------------------------------------------------------------------
+
+def _own_console():
+    """Windows 上，这个控制台窗口是不是只属于本程序（即双击 EXE 启动，而不是在 cmd 里运行）。
+    单文件 EXE 会有"启动器+本体"两个进程共用一个窗口，所以允许 {自己, 父进程}。"""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        arr = (ctypes.c_uint * 64)()
+        n = ctypes.windll.kernel32.GetConsoleProcessList(arr, 64)
+        if n == 0 or n > 64:
+            return False
+        return set(arr[:n]) <= {os.getpid(), os.getppid()}
+    except Exception:  # noqa
+        return False
+
+
+def _hide_own_console():
+    """图形窗口模式下，把多余的黑色控制台窗口藏起来（仅双击启动时）。"""
+    if not getattr(sys, "frozen", False) or not _own_console():
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:  # noqa
+        pass
+
+
+def _pause_before_exit(rc):
+    """双击 EXE 出错退出时停住窗口，让人看清原因。
+    计划任务/管道启动时 stdin 不是终端，不会停住，所以不影响开机自启和自动重启。"""
+    if rc in (0, None) or not getattr(sys, "frozen", False):
+        return
+    try:
+        if _own_console() and sys.stdin is not None and sys.stdin.isatty():
+            input("\n程序已退出（代码 %s）。请把上面的文字截图或复制给技术支持。按回车键关闭窗口……" % rc)
+    except Exception:  # noqa
+        pass
+
+
+def watch_dir_warnings(cfg):
+    """启动时检查监控目录，返回给人看的提示列表。目录不对是\"装好了却没数据\"的头号原因。"""
+    out = []
+    dirs = cfg.get("watch_dirs") or []
+    if not dirs:
+        out.append("config.json 里的 watch_dirs 是空的：服务能启动，但没有任何数据可发布。"
+                   "请填入存放 *_V3.db / .mbd 文件的文件夹。")
+    for d in dirs:
+        if not os.path.exists(d):
+            out.append("监控目录不存在：%s。请在 config.json 的 watch_dirs 里改成实际路径"
+                       "（路径里的反斜杠要写成 \\\\ 或改用 /）。" % d)
+            continue
+        try:
+            n = len(chrom_core.find_inputs([d]))
+        except Exception:  # noqa
+            n = 0
+        if n == 0:
+            out.append("监控目录里没有找到 *_V3.db 或 .mbd 文件：%s" % d)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 打包后自检：真的起一个服务，再用客户端连上读一遍
+# ---------------------------------------------------------------------------
+
+async def _selftest_async(cfg, port, timeout=45):
+    from asyncua import Client
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(run_server(cfg, stop))
+    url = "opc.tcp://127.0.0.1:%d/ChromExtract" % port
+    last = "尚未连上"
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if task.done():
+                exc = task.exception() if not task.cancelled() else None
+                return False, "服务没能启动：%s" % (exc or "已退出")
+            try:
+                async with Client(url, timeout=5) as c:
+                    idx = await c.get_namespace_index(cfg["namespace_uri"])
+                    chrom = await c.nodes.objects.get_child(["%d:Chromatograph" % idx])
+                    channels = 0
+                    for st in await chrom.get_children():
+                        if (await st.read_browse_name()).Name.startswith("Station_"):
+                            for dev in await st.get_children():
+                                nm = (await dev.read_browse_name()).Name
+                                if not nm.startswith("App"):
+                                    continue
+                                npts = await (await dev.get_child(
+                                    ["%d:LatestCycle" % idx, "%d:NumPoints" % idx])).read_value()
+                                arr = await (await dev.get_child(
+                                    ["%d:Trace" % idx, "%d:ValueArray" % idx])).read_value()
+                                if npts > 0 and len(arr) > 0:
+                                    channels += 1
+                    if channels:
+                        return True, "读到 %d 个检测器通道的谱图数据" % channels
+                    last = "已连上，但数据还没读出来"
+            except Exception as e:  # noqa
+                last = "%s: %s" % (type(e).__name__, e)
+            await asyncio.sleep(1)
+        return False, "超时（%d 秒）。最后一次状态：%s" % (timeout, last)
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(task, 10)
+        except Exception:  # noqa
+            pass
+
+
+def run_selftest():
+    """--selftest：在临时目录造演示数据，启动真实的 OPC UA 服务，用客户端读一遍。
+    不碰 config.json，不占用 4840 端口。通过返回 0，失败返回 1。"""
+    import shutil
+    import socket
+    print("色谱提取 OPC UA 服务 v%s —— 自检开始（约需 10 秒）" % __version__)
+    tmp = tempfile.mkdtemp(prefix="chrom_selftest_")
+    try:
+        import demo_data
+        data = os.path.join(tmp, "data")
+        os.makedirs(data)
+        demo_data.make_demo_db(os.path.join(data, "selftest_V3.db"))
+        with socket.socket() as sk:
+            sk.bind(("127.0.0.1", 0))
+            port = sk.getsockname()[1]
+        cfg = dict(DEFAULT_CONFIG)
+        cfg.update(endpoint="opc.tcp://127.0.0.1:%d/ChromExtract" % port,
+                   watch_dirs=[data], security="none", log_file="")
+        cfg["_base_dir"], cfg["_cfg_path"] = tmp, None
+        normalize_config(cfg, tmp)
+        logging.getLogger().setLevel(logging.ERROR)
+        ok, msg = asyncio.run(_selftest_async(cfg, port))
+    except Exception as e:  # noqa
+        ok, msg = False, "%s: %s" % (type(e).__name__, e)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(("[ 通过 ] " if ok else "[ 失败 ] ") + msg)
+    if ok:
+        print("程序本身工作正常。如果现场仍读不到数据，问题在 config.json 的监控目录或网络/防火墙。")
+    return 0 if ok else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1231,6 +1378,9 @@ def admin_menu(cfg_path):
 def main(argv=None):
     _force_utf8_stdout()
     ap = argparse.ArgumentParser(description="色谱提取 OPC UA 服务")
+    ap.add_argument("--version", action="version", version="ChromExtractOPC %s" % __version__)
+    ap.add_argument("--selftest", action="store_true",
+                    help="自检：造演示数据、启动服务、用客户端读一遍（不影响现有配置）")
     ap.add_argument("--config", default=None, help="配置文件（默认：程序目录 config.json）")
     ap.add_argument("--gui", action="store_true", help="打开图形监控窗口")
     ap.add_argument("--extract", nargs="+", metavar="源",
@@ -1246,7 +1396,12 @@ def main(argv=None):
     ap.add_argument("--add-user", metavar="用户名", help="添加账号或重设密码（会提示输入密码）")
     ap.add_argument("--remove-user", metavar="用户名", help="删除账号")
     ap.add_argument("--list-users", action="store_true", help="列出账号")
+    ap.add_argument("--set-watch-dir", nargs="+", metavar="文件夹",
+                    help="把数据目录（存放 *_V3.db / .mbd 的文件夹）写进配置文件")
     args = ap.parse_args(argv)
+
+    if args.selftest:
+        return run_selftest()
 
     base_dir = program_dir()
     cfg_path = args.config or os.path.join(base_dir, "config.json")
@@ -1273,6 +1428,24 @@ def main(argv=None):
         except config_tools.ConfigToolError as e:
             print("操作失败：%s" % e)
             return 2
+
+    if args.set_watch_dir:
+        try:
+            dirs = config_tools.set_watch_dirs(cfg_path, args.set_watch_dir)
+        except config_tools.ConfigToolError as e:
+            print("操作失败：%s" % e)
+            return 2
+        print("数据目录已设置为：")
+        for d in dirs:
+            try:
+                n = len(chrom_core.find_inputs([d]))
+            except Exception:  # noqa
+                n = 0
+            print("  %s  （其中找到 %d 个数据文件）" % (d, n))
+            if n == 0:
+                print("    注意：这个文件夹里暂时没有 *_V3.db 或 .mbd 文件，请确认路径是否对。")
+        print("服务运行中的话，下一轮扫描（最长 30 秒）内自动生效。")
+        return 0
 
     if args.hash_password:
         pw = getpass.getpass("输入密码：")
@@ -1312,6 +1485,8 @@ def main(argv=None):
     for lv, msg in security_report(cfg):
         if lv != "正常":
             get_log().warning("安全提示[%s]：%s", lv, msg)
+    for w in watch_dir_warnings(cfg):
+        get_log().warning("数据目录提示：%s", w)
     if args.gui:
         run_gui(cfg)
         return 0
@@ -1343,5 +1518,30 @@ def main(argv=None):
     return 0
 
 
+def _entry():
+    """程序入口：统一兜住未预期的错误，并在双击出错时停住窗口。"""
+    rc = 0
+    try:
+        rc = main()
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    except KeyboardInterrupt:
+        rc = 0
+    except Exception:  # noqa
+        import traceback
+        tb = traceback.format_exc()
+        print("程序遇到未预期的错误：\n" + tb)
+        try:
+            d = os.path.join(program_dir(), "logs")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "crash.log"), "a", encoding="utf-8") as f:
+                f.write("%s\n%s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tb))
+        except Exception:  # noqa
+            pass
+        rc = 1
+    _pause_before_exit(rc)
+    return rc
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entry())
