@@ -60,6 +60,10 @@ def _force_utf8_stdout():
             pass
 
 
+# 导入时就切到 UTF-8：测试直接调 run_selftest() 时不经过 main()，否则中文 print 在 cp1252 控制台下崩溃。
+_force_utf8_stdout()
+
+
 DEFAULT_CONFIG = {
     "endpoint": "opc.tcp://0.0.0.0:4840/ChromExtract",
     "namespace_uri": "urn:chromextract:opcua",
