@@ -163,6 +163,9 @@ begin
     '留空 = 稍后在设置页面里再选。升级安装时留空会保留原来的设置。', False, '');
   DataPage.Add('数据文件夹：');
   DataPage.Values[0] := '';
+  { DIAG #10: silent install only - give the data page an existing default path to test whether the empty value is what the wizard validation rejects; interactive installs still start empty }
+  if WizardSilent then
+    DataPage.Values[0] := 'C:\Windows\Temp';
 
   FwPage := CreateInputQueryPage(DataPage.ID, '防火墙',
     '只允许指定的客户端访问 OPC UA 端口 4840（强烈建议）',
