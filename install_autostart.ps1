@@ -19,7 +19,8 @@ try {
   }
   if (-not (Test-Path -LiteralPath $Exe)) { throw "找不到程序：$Exe" }
   $dir = Split-Path -Parent $Exe
-  $action = New-ScheduledTaskAction -Execute $Exe -WorkingDirectory $dir
+  # --background：后台静默运行，不弹窗口，日志写 logs\server.log；单实例，不会重复启动
+  $action = New-ScheduledTaskAction -Execute $Exe -Argument '--background' -WorkingDirectory $dir
   $trigger = New-ScheduledTaskTrigger -AtStartup
   # 关键：默认的 schtasks 创建的任务运行满 72 小时会被系统强制结束；这里设为不限时，
   # 并且程序异常退出后每分钟自动重启一次。
@@ -27,7 +28,8 @@ try {
       -ExecutionTimeLimit ([TimeSpan]::Zero) `
       -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
       -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-      -MultipleInstances IgnoreNew
+      -MultipleInstances IgnoreNew -Hidden `
+      -Priority 6
   if ($System) {
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Limited
     Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger `

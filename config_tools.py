@@ -194,3 +194,173 @@ def set_watch_dirs(path, dirs):
     data["watch_dirs"] = cleaned
     write_atomic(path, data)
     return cleaned
+
+
+# ---------------------------------------------------------------------------
+# 网页设置页用：批量修改普通配置项
+# ---------------------------------------------------------------------------
+
+# 允许在网页里修改的项及类型（账号/密码不走这里，走 add_user/remove_user）
+EDITABLE = {
+    "endpoint": str, "server_name": str, "namespace_uri": str,
+    "watch_dirs": list, "poll_seconds": int, "last_n": int, "max_points": int,
+    "security": str, "allow_anonymous": bool, "allow_insecure_fallback": bool,
+    "remote_export": bool, "export_min_interval_sec": int, "max_connections": int,
+    "csv_export_dir": str, "max_trace_points": int, "max_file_mb": int,
+    "log_max_mb": int, "log_backups": int,
+    "web_ui": bool, "web_host": str, "web_port": int,
+    "web_https": str, "web_cert_file": str, "web_key_file": str,
+    "alert_stale_minutes": int, "alert_scan_errors": int, "alert_webhook": str,
+    "alert_email_to": str, "smtp_host": str, "smtp_port": int, "smtp_security": str,
+    "smtp_user": str, "smtp_from": str,
+    "alert_webhook_level": str, "alert_email_level": str,
+    "env_check_on_start": bool, "env_check_hours": int,
+}
+
+
+def _coerce(key, val):
+    typ = EDITABLE[key]
+    try:
+        if typ is bool:
+            if isinstance(val, str):
+                return val.strip().lower() in ("1", "true", "yes", "on")
+            return bool(val)
+        if typ is int:
+            return int(str(val).strip())
+        if typ is list:
+            if isinstance(val, str):
+                val = [x for x in val.replace("\r", "").split("\n")]
+            return [str(x).strip().strip('"').strip() for x in val if str(x).strip()]
+        return str(val).strip()
+    except (TypeError, ValueError):
+        raise ConfigToolError("配置项 %s 的值不对：%r" % (key, val))
+
+
+def update_settings(path, updates, validate=None):
+    """只修改 updates 里给出的、且在 EDITABLE 中的项。
+    validate(合并后的字典) 抛异常即拒绝写入（原文件不变）。返回实际改动的键列表。"""
+    if not isinstance(updates, dict):
+        raise ConfigToolError("提交的数据格式不对。")
+    unknown = [k for k in updates if k not in EDITABLE]
+    if unknown:
+        raise ConfigToolError("这些项不允许在网页里修改：%s" % "、".join(unknown))
+    data = read_raw(path)
+    changed = []
+    for k, v in updates.items():
+        v = _coerce(k, v)
+        if k == "watch_dirs":
+            for d in v:
+                if not os.path.isdir(os.path.abspath(os.path.expanduser(d))):
+                    raise ConfigToolError("找不到这个文件夹：%s" % d)
+        if data.get(k) != v:
+            data[k] = v
+            changed.append(k)
+    if not changed:
+        return []
+    if validate is not None:
+        try:
+            validate(dict(data))
+        except Exception as e:  # noqa
+            raise ConfigToolError(str(e))
+    write_atomic(path, data)
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# 需要"取回原文"的密码（例如发邮件用的 SMTP 密码）
+# 不能像登录密码那样只存哈希。Windows 上用系统 DPAPI（本机范围）加密后再写进 config.json：
+# 配置文件被拷到别的电脑上无法解密。非 Windows 只做 Base64 混淆，并在体检里提示。
+# ---------------------------------------------------------------------------
+
+def _dpapi(data, protect):
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buf = ctypes.create_string_buffer(data, len(data))
+    inp = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = BLOB()
+    CRYPTPROTECT_UI_FORBIDDEN, CRYPTPROTECT_LOCAL_MACHINE = 0x1, 0x4
+    flags = CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE   # 本机任何账号（含 SYSTEM 服务）都能解密
+    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(inp), None, None, None, None, flags, ctypes.byref(out)):
+        raise ConfigToolError("系统加密/解密失败（错误码 %d）" % ctypes.GetLastError())
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def protect_secret(text):
+    import base64
+    raw = (text or "").encode("utf-8")
+    if os.name == "nt":
+        return "dpapi:" + base64.b64encode(_dpapi(raw, True)).decode("ascii")
+    return "b64:" + base64.b64encode(raw).decode("ascii")
+
+
+def unprotect_secret(stored):
+    import base64
+    s = str(stored or "")
+    if not s:
+        return ""
+    if s.startswith("dpapi:"):
+        if os.name != "nt":
+            raise ConfigToolError("这个密码是在 Windows 上加密的，只能在原来那台电脑上使用。")
+        try:
+            return _dpapi(base64.b64decode(s[6:]), False).decode("utf-8")
+        except ConfigToolError:
+            raise ConfigToolError("无法解密 SMTP 密码：配置文件可能是从别的电脑拷过来的，请重新设置密码。")
+    if s.startswith("b64:"):
+        return base64.b64decode(s[4:]).decode("utf-8")
+    raise ConfigToolError("smtp_password 格式不对：请不要手写，在设置页面里设置。")
+
+
+def set_smtp_password(path, password):
+    """设置/清除 SMTP 密码（空字符串 = 清除）。"""
+    if password and len(password) > 256:
+        raise ConfigToolError("密码太长。")
+    data = read_raw(path)
+    data["smtp_password"] = protect_secret(password) if password else ""
+    write_atomic(path, data)
+
+
+def set_quiet(path, items, normalize):
+    """整体替换静默时段列表。normalize 校验（alerts.normalize_quiet），不合法不写入。"""
+    try:
+        items = normalize(items)
+    except ValueError as e:
+        raise ConfigToolError(str(e))
+    data = read_raw(path)
+    data["alert_quiet"] = items
+    write_atomic(path, data)
+    return items
+
+
+def set_channel_rule(path, rule, normalize):
+    """新增/替换/删除某通道的规则。rule 里只有 channel（其余为空）表示删除。"""
+    data = read_raw(path)
+    rules = [r for r in (data.get("alert_channel_rules") or []) if r.get("channel") != rule.get("channel")]
+    if rule.get("mute") or rule.get("stale_minutes") not in (None, ""):
+        rules.append(rule)
+    try:
+        rules = normalize(rules)
+    except ValueError as e:
+        raise ConfigToolError(str(e))
+    data["alert_channel_rules"] = rules
+    write_atomic(path, data)
+    return rules
+
+
+def set_probes(path, items, normalize):
+    """整体替换设备检测列表（normalize = probes.normalize_probes），不合法不写入。"""
+    try:
+        items = normalize(items)
+    except ValueError as e:
+        raise ConfigToolError(str(e))
+    data = read_raw(path)
+    data["alert_probes"] = items
+    write_atomic(path, data)
+    return items

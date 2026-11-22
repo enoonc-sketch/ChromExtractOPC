@@ -1,0 +1,11 @@
+build/
+build_env/
+dist/
+dist-installer/
+*.spec
+__pycache__/
+logs/
+certs/
+config.json.bak
+*.pfx
+*.p12
