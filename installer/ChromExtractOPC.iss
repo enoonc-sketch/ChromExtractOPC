@@ -41,7 +41,8 @@ SignedUninstaller=yes
 #endif
 
 [Languages]
-Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+; 语言文件随仓库走（installer/Languages/）：运行器上 Inno Setup 6.7.1 自带的 Languages 目录里没有 ChineseSimplified.isl，写 compiler: 路径会编译失败
+Name: "chs"; MessagesFile: "Languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "autostart"; Description: "开机自动在后台运行服务"; GroupDescription: "运行方式："
@@ -169,6 +170,14 @@ begin
     '  192.168.1.0/24' + #13#10 + '  192.168.1.20,192.168.1.21' + #13#10 +
     '留空 = 不修改防火墙（之后可运行 设置防火墙.bat）。');
   FwPage.Add('允许访问的地址：', False);
+end;
+
+{ 静默安装时跳过数据文件夹页：留空=稍后在设置页面里再选；向导框架层校验不认空值，走到该页就中止安装 }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (PageID = DataPage.ID) and WizardSilent then
+    Result := True;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
