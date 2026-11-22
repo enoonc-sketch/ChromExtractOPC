@@ -1,0 +1,43 @@
+[
+  {
+    "label": "GC-1",
+    "kind": "modbus_rtu",
+    "params": {
+      "port": "COM3",
+      "baud": 9600,
+      "parity": "N",
+      "unit": 1,
+      "func": 3,
+      "addr": 0,
+      "count": 10
+    }
+  },
+  {
+    "label": "GC-2",
+    "kind": "modbus_rtu",
+    "params": {
+      "port": "COM3",
+      "baud": 9600,
+      "parity": "N",
+      "unit": 2,
+      "func": 3,
+      "addr": 0,
+      "count": 10
+    }
+  },
+  {
+    "label": "DCS 服务器",
+    "kind": "ping",
+    "params": {
+      "host": "192.168.1.10"
+    }
+  },
+  {
+    "label": "本服务 OPC UA",
+    "kind": "tcp",
+    "params": {
+      "host": "127.0.0.1",
+      "port": 4840
+    }
+  }
+]

@@ -80,7 +80,7 @@ class Console(unittest.TestCase):
 class Deployment(unittest.TestCase):
     """发布文件夹里必须有的脚本，build_exe.bat 与 CI 都要复制它们（之前漏过，导致装不上）。"""
     REQUIRED = ["安装.bat", "卸载.bat", "启动服务.bat", "启动图形界面.bat", "安装开机自启.bat",
-                "install_autostart.ps1", "设置防火墙.bat", "安全管理.bat", "使用说明_OPCUA.md"]
+                "install_autostart.ps1", "设置防火墙.bat", "安全管理.bat", "打开设置页面.bat", "后台启动.bat", "停止后台服务.bat", "安装为Windows服务.bat", "卸载Windows服务.bat", "使用说明_OPCUA.md"]
 
     def _read(self, name):
         with open(os.path.join(ROOT, name), "rb") as f:
@@ -110,6 +110,88 @@ class Deployment(unittest.TestCase):
         ps = self._read("install_autostart.ps1").decode("utf-8-sig")
         self.assertIn("ExecutionTimeLimit", ps)
         self.assertIn("RestartCount", ps)
+
+
+class ExeBuild(unittest.TestCase):
+    """打包时必须带上动态导入的模块，否则 EXE 里打不开设置页面。"""
+
+    def test_hidden_imports(self):
+        for f in ("build_exe.bat", ".github/workflows/build-exe.yml"):
+            text = open(os.path.join(ROOT, f), encoding="utf-8").read()
+            for mod in ("web_settings", "demo_data", "config_tools", "alerts", "nettest", "stability", "probes", "drivercheck", "envwatch", "bgrun", "winservice"):
+                self.assertIn("--hidden-import " + mod, text, f + " 缺少 " + mod)
+            self.assertIn("selftest", text)
+            self.assertIn("--icon assets\\app.ico", text, f + " 没有设置 EXE 图标")
+            self.assertIn("SHA256", text)
+
+
+class Installer(unittest.TestCase):
+    """Inno Setup 脚本：引用的文件都存在、带 BOM、升级不覆盖配置、卸载清理任务和防火墙。"""
+
+    def setUp(self):
+        with open(os.path.join(ROOT, "installer", "ChromExtractOPC.iss"), "rb") as f:
+            self.raw = f.read()
+        self.text = self.raw.decode("utf-8-sig")
+
+    def test_icon(self):
+        self.assertIn("SetupIconFile=..\\assets\\app.ico", self.text)
+        import struct
+        with open(os.path.join(ROOT, "assets", "app.ico"), "rb") as f:
+            data = f.read()
+        reserved, typ, n = struct.unpack("<HHH", data[:6])
+        self.assertEqual((reserved, typ), (0, 1), "不是有效的 .ico 文件")
+        sizes = {data[6 + 16 * i] or 256 for i in range(n)}   # 宽度字节，0 表示 256
+        for s in (16, 32, 48, 256):
+            self.assertIn(s, sizes)
+
+    def test_bom(self):
+        self.assertTrue(self.raw.startswith(b"\xef\xbb\xbf"), "iss 必须是 UTF-8 带 BOM")
+
+    def test_sources_exist(self):
+        import re
+        for src in re.findall(r'Source: "\.\.\\([^"]+)"', self.text):
+            self.assertTrue(os.path.exists(os.path.join(ROOT, src)), src)
+
+    def test_config_preserved(self):
+        line = [l for l in self.text.splitlines() if 'config.json' in l and l.startswith("Source")][0]
+        self.assertIn("onlyifdoesntexist", line)
+        self.assertIn("uninsneveruninstall", line)
+
+    def test_uninstall_cleans_up(self):
+        self.assertIn("-Remove", self.text)
+        self.assertIn("firewall delete rule", self.text)
+        self.assertIn("--no-pause", self.text)
+
+    def test_build_installer_bat_crlf(self):
+        data = open(os.path.join(ROOT, "build_installer.bat"), "rb").read()
+        self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
+
+
+class CodeSigning(unittest.TestCase):
+    """签名必须是可选的（没证书也能打包），配置了就覆盖 EXE、安装程序和卸载程序。"""
+
+    def _t(self, n):
+        return open(os.path.join(ROOT, n), encoding="utf-8-sig").read()
+
+    def test_sign_script(self):
+        ps = self._t("sign.ps1")
+        for k in ("SIGN_THUMBPRINT", "SIGN_PFX", "SIGN_PFX_BASE64", "/fd sha256", "/tr", "verify"):
+            self.assertIn(k, ps)
+        self.assertTrue(open(os.path.join(ROOT, "sign.ps1"), "rb").read().startswith(b"\xef\xbb\xbf"))
+
+    def test_wired_everywhere(self):
+        self.assertIn("sign.ps1 -Check", self._t("build_exe.bat"))
+        self.assertIn("/DSIGN", self._t("build_installer.bat"))
+        self.assertIn("SignedUninstaller=yes", self._t("installer/ChromExtractOPC.iss"))
+        self.assertIn("secrets.SIGN_PFX_BASE64", self._t(".github/workflows/build-exe.yml"))
+
+    def test_no_private_keys_committed(self):
+        self.assertIn("*.pfx", self._t(".gitignore"))
+        for dp, _, fn in os.walk(ROOT):
+            if "build_env" in dp:
+                continue
+            for f in fn:
+                self.assertFalse(f.lower().endswith((".pfx", ".p12")), os.path.join(dp, f))
 
 
 if __name__ == "__main__":

@@ -41,6 +41,7 @@ import threading
 import time
 from datetime import datetime
 
+import alerts
 import chrom_core
 import config_tools
 from config_tools import hash_password, verify_password   # noqa: F401  (hash_password 也供测试使用)
@@ -83,12 +84,39 @@ DEFAULT_CONFIG = {
     "max_file_mb": 256,               # 单个 .mbd 文件大小上限
     "log_max_mb": 5,                  # 单个日志文件大小，超出自动轮转
     "log_backups": 5,                 # 保留的历史日志个数
+    # ---- 网页设置页（v2.4 新增）----
+    "web_ui": True,                   # 服务运行时同时开启浏览器设置页面
+    "web_host": "127.0.0.1",          # 默认只允许本机访问；改成其它地址后必须账号登录
+    "web_port": 8840,
+    "web_https": "auto",              # auto：对外开放时自动 HTTPS；on / off
+    "web_cert_file": "",              # 留空 = 自动生成自签名证书 certs/web_cert.pem
+    "web_key_file": "",
+    # ---- 异常告警（v2.4 新增）----
+    "alert_stale_minutes": 120,       # 某通道超过这么多分钟没有新周期就告警；0 = 不检查
+    "alert_scan_errors": 3,           # 连续扫描出错次数达到就告警；0 = 不检查
+    "alert_webhook": "",              # 可选：企业微信/钉钉/飞书机器人或任意 https 地址，告警出现/恢复时推送
+    "alert_email_to": "",             # 可选：告警邮件收件人，多个用逗号隔开
+    "smtp_host": "",                  # SMTP 服务器，例如 smtp.exmail.qq.com
+    "smtp_port": 465,
+    "smtp_security": "ssl",           # ssl（465）/ starttls（587）/ none（仅内网免登录中继，25）
+    "smtp_user": "",
+    "smtp_password": "",              # 在设置页面里设置，Windows 上以 DPAPI 加密保存，不要手写
+    "smtp_from": "",                  # 发件人，留空 = smtp_user
+    # 各渠道发送哪些级别：all = 严重和警告都发 / critical = 只发严重 / off = 不发
+    "alert_webhook_level": "all",
+    "alert_email_level": "critical",
+    "alert_quiet": [],                # 静默时段（计划停机/检修时不推送），在设置页面里添加
+    "alert_channel_rules": [],        # 按通道屏蔽告警 / 单独设置无新周期分钟数，在设置页面通道表里设置
+    "alert_probes": [],               # 设备检测：定时 Ping / 端口 / Modbus 等，失败走告警；在设置页面里添加
+    "env_check_on_start": True,       # 服务启动后自动做驱动与软件环境检测，"问题"级别的项告警
+    "env_check_hours": 6,             # 之后每几小时复查一次；0 = 只在启动时检查
 }
 
 
 APP_URI = "urn:chromextract:opcua:server"   # 服务端应用 URI，必须与证书里一致
 
 log_q = queue.Queue()
+ALERTS = {}      # {"monitor": AlertMonitor}，服务运行时供网页/窗口读取
 
 
 def get_log():
@@ -102,14 +130,16 @@ class _SafeFormatter(logging.Formatter):
         return super().format(record).replace("\r", " ").replace("\n", " ")
 
 
-def setup_logging(cfg, base_dir):
+def setup_logging(cfg, base_dir, console=True):
     fmt = _SafeFormatter("%(asctime)s [%(levelname)s] %(message)s")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     logging.getLogger("asyncua").setLevel(logging.WARNING)
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    root.handlers = [sh]
+    root.handlers = []
+    if console:                       # 后台模式不往控制台写（没有控制台，写了也白写）
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
     if cfg.get("log_file"):
         lf = os.path.join(base_dir, cfg["log_file"])
         os.makedirs(os.path.dirname(lf), exist_ok=True)
@@ -214,8 +244,12 @@ def gather_snapshot(watch_dirs, last_n, max_points, cache=None):
 
 # 改了配置文件后，下面这些项不用重启就能生效；其余项（端口、加密方式、证书等）需要重启。
 HOT_KEYS = ("users", "allow_anonymous", "remote_export", "export_min_interval_sec",
-            "watch_dirs", "last_n", "max_points", "poll_seconds")
-RESTART_KEYS = ("endpoint", "security", "allow_insecure_fallback", "cert_dir",
+            "watch_dirs", "last_n", "max_points", "poll_seconds",
+            "alert_stale_minutes", "alert_scan_errors", "alert_webhook",
+            "alert_email_to", "smtp_host", "smtp_port", "smtp_security", "smtp_user",
+            "smtp_password", "smtp_from", "alert_webhook_level", "alert_email_level", "alert_quiet",
+            "alert_channel_rules", "alert_probes", "env_check_hours")
+RESTART_KEYS = ("env_check_on_start", "endpoint", "security", "allow_insecure_fallback", "cert_dir",
                 "trusted_client_certs_dir", "max_connections", "namespace_uri", "server_name")
 
 
@@ -261,7 +295,7 @@ def try_hot_reload(cfg, stamp, reload_cb=None):
     return now
 
 
-def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None):
+def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None, monitor=None):
     """循环扫描数据源；发现新周期即通过回调推给 OPC UA 循环。"""
     last_sig = None
     cache = {}
@@ -277,6 +311,8 @@ def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None):
                                    cfg.get("max_points", 20000), cache)
             sig = {r["source"] + "|%s|%s|%s" % (r["app"], r["stream"], r["det"]): r["cycle_id"]
                    for r in recs}
+            if monitor is not None:
+                monitor.on_scan(recs)
             if sig != last_sig:
                 new_cnt = sum(1 for k, v in sig.items() if (last_sig or {}).get(k) != v)
                 get_log().info("扫描到 %d 个检测器通道，其中 %d 个有更新", len(sig), new_cnt)
@@ -284,6 +320,11 @@ def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None):
                 snapshot_cb(recs)
         except Exception as e:  # noqa
             get_log().error("扫描出错：%s", e)
+            if monitor is not None:
+                try:
+                    monitor.on_scan_error(e)
+                except Exception:  # noqa
+                    pass
         if beat_cb is not None:
             beat_cb()          # 心跳：即使没有新数据，客户端也能确认服务还活着
         stop_evt.wait(interval)
@@ -534,6 +575,13 @@ class OpcUaApp:
         # 心跳：每轮扫描 +1，客户端据此判断服务是否卡死（没有新周期时数据本身不会变）
         self.n_beat = await self.root.add_variable(self.idx, "Heartbeat", 0)
         self.n_scan = await self.root.add_variable(self.idx, "LastScanTime", "")
+        # 告警：客户端/DCS 可直接订阅 Alarms.ActiveCount 或 Alarms.Severity 做报警
+        al = await self.root.add_object(self.idx, "Alarms")
+        self.n_al_count = await al.add_variable(self.idx, "ActiveCount", 0)
+        self.n_al_sev = await al.add_variable(self.idx, "Severity", 0)        # 0 正常 / 1 警告 / 2 严重
+        self.n_al_text = await al.add_variable(self.idx, "Text", "")
+        self.n_al_time = await al.add_variable(self.idx, "LastChange", "")
+        self.n_al_quiet = await al.add_variable(self.idx, "NotifySilenced", False)   # 推送是否处于静默时段
         # 远程方法：ExportCSV -> 导出最新数据为 CSV，返回输出路径
         self.n_export = await self.root.add_method(
             self.idx, "ExportCSV", self._export_csv, [],
@@ -561,6 +609,20 @@ class OpcUaApp:
 
         self.server.set_certificate_validator(validator)
         get_log().info("已启用客户端证书白名单：%d 个客户端", len(trusted))
+
+    async def write_alarms(self, snap):
+        sev = {"正常": 0, "警告": 1, "严重": 2}.get(snap["worst"], 0)
+        text = "；".join("[%s] %s" % (a["level"], a["text"]) for a in snap["active"])[:2000]
+        try:
+            await self.n_al_quiet.write_value(bool(snap.get("quiet")))
+            if (sev, text) != getattr(self, "_al_last", None):
+                self._al_last = (sev, text)
+                await self.n_al_count.write_value(len(snap["active"]))
+                await self.n_al_sev.write_value(sev)
+                await self.n_al_text.write_value(text)
+                await self.n_al_time.write_value(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:  # noqa
+            pass
 
     async def beat(self):
         self._beats += 1
@@ -759,10 +821,36 @@ async def run_server(cfg, stop_evt=None):
         loop.call_soon_threadsafe(_spawn, recs)
 
     stop_flag = threading.Event()
+    notifier = alerts.make_notifier(cfg, get_log())
+    monitor = alerts.AlertMonitor(cfg, log=get_log(), notifier=notifier)
+    notifier.is_muted = lambda k: (k.startswith(("stale:", "missing:")) and monitor._muted(k.split(":", 1)[1]))
+    import probes
+    probe_mon = probes.ProbeMonitor(cfg, monitor, log=get_log()).start()
+    ALERTS["probes"] = probe_mon
+    import envwatch
+    env_mon = envwatch.EnvWatch(cfg, monitor, log=get_log()).start()
+    ALERTS["env"] = env_mon
+    ALERTS["monitor"] = monitor
     th = threading.Thread(target=watcher_thread,
-                          args=(snapshot_cb, stop_flag, cfg, beat_cb, app.user_manager.reload),
+                          args=(snapshot_cb, stop_flag, cfg, beat_cb, app.user_manager.reload, monitor),
                           daemon=True)
     th.start()
+
+    async def alarm_loop():
+        # 独立于扫描线程：扫描线程卡死时也能发现并告警
+        while not stop_evt.is_set():
+            try:
+                monitor.evaluate()
+                notifier.tick(monitor.active_alerts())     # 静默结束后补发仍未恢复的告警
+                await app.write_alarms(monitor.snapshot())
+            except Exception as e:  # noqa
+                get_log().error("告警检查出错：%s", e)
+            try:
+                await asyncio.wait_for(stop_evt.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+    alarm_task = asyncio.ensure_future(alarm_loop())
+    pending.add(alarm_task)
     get_log().info("数据监控已启动，监控目录：%s（每 %s 秒扫描）",
                    cfg.get("watch_dirs") or ["（空）"], cfg.get("poll_seconds", 30))
 
@@ -770,6 +858,12 @@ async def run_server(cfg, stop_evt=None):
         await stop_evt.wait()
     finally:
         stop_flag.set()
+        alarm_task.cancel()
+        probe_mon.stop()
+        env_mon.stop()
+        ALERTS.pop("env", None)
+        ALERTS.pop("monitor", None)
+        ALERTS.pop("probes", None)
         await app.server.stop()
         get_log().info("服务已停止")
 
@@ -924,6 +1018,67 @@ def security_summary(cfg):
                           ("%d 项注意事项，无风险" % note if note else "全部正常"))
 
 
+def ssl_error_types():
+    import ssl
+    return (ssl.SSLError, ValueError)
+
+
+def start_web_settings(cfg, open_browser=False):
+    """开启浏览器设置页面；失败（如端口被占用）只记日志，不影响 OPC UA 服务。"""
+    if not cfg.get("web_ui", True):
+        return None
+    import web_settings
+    try:
+        return web_settings.SettingsServer(cfg["_cfg_path"], cfg["_base_dir"], sys.modules[__name__],
+                                           host=cfg.get("web_host") or "127.0.0.1",
+                                           port=cfg.get("web_port", 8840), log=get_log(),
+                                           https=cfg.get("web_https", "auto"),
+                                           cert_file=cfg.get("web_cert_file", ""),
+                                           key_file=cfg.get("web_key_file", ""),
+                                           cert_dir=os.path.join(cfg["_base_dir"], cfg.get("cert_dir") or "certs"),
+                                           ).start(open_browser=open_browser)
+    except ImportError as e:
+        get_log().error("设置页面需要 HTTPS，但无法加载 cryptography 库：%s", e)
+        return None
+    except (ssl_error_types()) as e:
+        get_log().error("设置页面 HTTPS 证书无法使用（检查 web_cert_file / web_key_file）：%s", e)
+        return None
+    except OSError as e:
+        get_log().error("设置页面无法启动（端口 %s 可能被占用，可在 config.json 改 web_port）：%s",
+                        cfg.get("web_port"), e)
+        return None
+
+
+def run_settings_only(cfg):
+    """只打开设置页面（不启动 OPC UA 服务），按 Ctrl+C 或关闭窗口结束。"""
+    cfg = dict(cfg, web_ui=True)
+    ws = start_web_settings(cfg, open_browser=True)
+    if ws is None:
+        return 3
+    print("设置页面已打开：%s\n（浏览器没自动打开就手动复制这个地址；改完关闭本窗口即可）" % ws.url())
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    ws.stop()
+    return 0
+
+
+def _resource(rel):
+    """打包后资源在 PyInstaller 解压目录（sys._MEIPASS），源码运行时在程序目录。"""
+    return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), rel)
+
+
+def _set_window_icon(win):
+    try:
+        ico = _resource(os.path.join("assets", "app.ico"))
+        if os.path.exists(ico):
+            win.iconbitmap(default=ico)       # default=：之后弹出的子窗口/对话框也用同一个图标
+    except Exception:  # noqa  图标失败不影响使用（例如非 Windows 系统）
+        pass
+
+
 def run_gui(cfg):
     import tkinter as tk
     from tkinter import scrolledtext
@@ -931,6 +1086,7 @@ def run_gui(cfg):
 
     root = tk.Tk()
     root.title("色谱提取 OPC UA 服务 v%s" % __version__)
+    _set_window_icon(root)
     root.geometry("760x520")
 
     status = tk.StringVar(value="启动中…")
@@ -942,6 +1098,15 @@ def run_gui(cfg):
     tk.Label(bar, textvariable=sec_var, anchor="w").pack(side="left")
     tk.Button(bar, text="安全设置…",
               command=lambda: SecurityWindow(root, cfg, _TkDialogs(root))).pack(side="right")
+    web = {}
+
+    def open_web():
+        import webbrowser
+        ws = web.get("srv") or start_web_settings(dict(cfg, web_ui=True))
+        if ws is not None:
+            web["srv"] = ws
+            webbrowser.open(ws.url())
+    tk.Button(bar, text="打开设置页面…", command=open_web).pack(side="right", padx=4)
     box = scrolledtext.ScrolledText(root, state="disabled")
     box.pack(fill="both", expand=True, padx=10, pady=6)
 
@@ -958,7 +1123,13 @@ def run_gui(cfg):
         root.after(300, pump_log)
 
     def refresh_sec():
-        sec_var.set(security_summary(cfg))       # 配置热加载后摘要随之更新
+        text = security_summary(cfg)       # 配置热加载后摘要随之更新
+        mon = ALERTS.get("monitor")
+        if mon is not None:
+            snap = mon.snapshot()
+            text = ("告警：%d 项（%s）    " % (len(snap["active"]), snap["worst"]) if snap["active"]
+                    else "告警：无    ") + ("[推送静默至 %s]    " % snap["quiet"]["until"] if snap.get("quiet") else "") + text
+        sec_var.set(text)
         root.after(5000, refresh_sec)
 
     class QHandler(logging.Handler):
@@ -989,6 +1160,7 @@ def run_gui(cfg):
             worker_done.set()
 
     threading.Thread(target=server_worker, daemon=True).start()
+    web["srv"] = start_web_settings(cfg)
     status.set("运行中：%s" % cfg["endpoint"])
     pump_log()
     refresh_sec()
@@ -1117,6 +1289,152 @@ async def _selftest_async(cfg, port, timeout=45):
             pass
 
 
+def _selftest_web(tmp):
+    """自检设置页面：用 HTTPS 启动在随机端口，读一次状态（确认证书生成、TLS、页面都正常）。"""
+    import ssl
+    import urllib.request
+    import web_settings
+    cfg_path = os.path.join(tmp, "config.json")
+    with open(cfg_path, "w", encoding="utf-8") as f:
+        json.dump({"poll_seconds": 30}, f)
+    srv = web_settings.SettingsServer(cfg_path, tmp, sys.modules[__name__], port=0, https="on",
+                                      cert_dir=os.path.join(tmp, "certs"))
+    srv.start()
+    try:
+        ctx = ssl.create_default_context(cafile=os.path.join(tmp, "certs", "web_cert.pem"))
+        with urllib.request.urlopen(srv.url() + "api/state", context=ctx, timeout=10) as r:
+            st = json.loads(r.read().decode("utf-8"))
+        if not st.get("https") or st["config"].get("poll_seconds") != 30:
+            return False, "设置页面返回内容不对"
+        return True, "设置页面（HTTPS）正常"
+    finally:
+        srv.stop()
+
+
+def run_nettest_cli(argv):
+    """--nettest 类型 [位置参数...] [键=值...]"""
+    import nettest
+    kind, rest = argv[0], argv[1:]
+    if kind not in nettest.TESTS:
+        print("未知的测试类型：%s\n可用：%s" % (kind, " ".join(nettest.TESTS)))
+        return 2
+    names = nettest.TESTS[kind][1]
+    params, pos = {}, 0
+    for a in rest:
+        if "=" in a:
+            k, v = a.split("=", 1)
+            params[k.strip()] = v
+        elif pos < len(names):
+            params[names[pos]] = a
+            pos += 1
+    r = nettest.run_test(kind, params)
+    print(("[ 成功 ] " if r["ok"] else "[ 失败 ] ") + r["summary"])
+    for line in r["details"]:
+        print("    " + line)
+    return 0 if r["ok"] else 1
+
+
+def run_stability_cli(argv):
+    """--stability 类型 [位置参数...] [键=值...] interval=秒 minutes=分钟；Ctrl+C 提前结束并输出统计。"""
+    import nettest
+    import stability
+    kind, rest = argv[0], argv[1:]
+    if kind not in stability.ALLOWED:
+        print("不支持的类型：%s\n可用：%s" % (kind, " ".join(stability.ALLOWED)))
+        return 2
+    names = nettest.TESTS[kind][1]
+    params, pos, interval, minutes = {}, 0, 1.0, 10.0
+    for a in rest:
+        if "=" in a:
+            k, v = a.split("=", 1)
+            if k == "interval":
+                interval = v
+            elif k == "minutes":
+                minutes = v
+            else:
+                params[k.strip()] = v
+        elif pos < len(names):
+            params[names[pos]] = a
+            pos += 1
+    out_dir = os.path.join(program_dir(), "logs", "stability")
+    try:
+        run = stability.StabilityRun(kind, params, interval, minutes, out_dir=out_dir)
+    except stability.StabilityError as e:
+        print(e)
+        return 2
+    print("稳定性测试：%s %s，每 %s 秒一次，共 %s 分钟。按 Ctrl+C 提前结束。" % (
+        stability.ALLOWED[kind], run.target(), interval, minutes))
+    th = threading.Thread(target=run.run_blocking, daemon=True)
+    th.start()
+    try:
+        while th.is_alive():
+            th.join(10)
+            st = run.stats()
+            print("  %s  %d 次  失败 %d（%s%%）  平均 %s ms  P95 %s ms" % (
+                st["elapsed_text"], st["n"], st["fail"], st["loss_pct"], st["avg"], st["p95"]))
+    except KeyboardInterrupt:
+        run.stop()
+        th.join(15)
+    st = run.stats()
+    print("\n结论：%s" % st["verdict"])
+    print("次数 %d，失败 %d（%s%%），最长连续失败 %d" % (st["n"], st["fail"], st["loss_pct"], st["max_streak"]))
+    print("延迟 ms：最小 %s / 平均 %s / P95 %s / P99 %s / 最大 %s，抖动 %s" % (
+        st["min"], st["avg"], st["p95"], st["p99"], st["max"], st["jitter"]))
+    for e in st["errors"]:
+        print("  错误 %d 次：%s" % (e["count"], e["text"]))
+    for h in st["hints"]:
+        print("  建议：" + h)
+    if st["csv"]:
+        print("明细：%s" % os.path.join(out_dir, st["csv"]))
+    return 0 if st["fail"] == 0 else 1
+
+
+def run_stability_multi_cli(argv):
+    import stability
+    path, interval, minutes = argv[0], 1.0, 10.0
+    for a in argv[1:]:
+        k, _, v = a.partition("=")
+        if k == "interval":
+            interval = v
+        elif k == "minutes":
+            minutes = v
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            targets = json.load(f)
+    except (OSError, ValueError) as e:
+        print("读不了目标文件 %s：%s" % (path, e))
+        return 2
+    out_dir = os.path.join(program_dir(), "logs", "stability")
+    try:
+        m = stability.MultiRun(targets, interval, minutes, out_dir=out_dir)
+    except stability.StabilityError as e:
+        print(e)
+        return 2
+    print("多目标稳定性测试：%d 个目标，每 %s 秒，共 %s 分钟。按 Ctrl+C 提前结束。" % (len(m.runs), interval, minutes))
+    th = threading.Thread(target=m.run_blocking, daemon=True)
+    th.start()
+    try:
+        while th.is_alive():
+            th.join(15)
+            st = m.stats()
+            print("  %s  " % st["elapsed_text"] + "  ".join(
+                "%s:%d次/失败%d" % (r["label"], r["n"], r["fail"]) for r in st["rows"]))
+    except KeyboardInterrupt:
+        m.stop()
+        th.join(20)
+    st = m.stats()
+    print("\n%-12s %-28s %7s %7s %8s %10s %10s" % ("名称", "目标", "次数", "失败", "失败率%", "连续失败", "平均ms"))
+    for r in st["rows"]:
+        print("%-12s %-28s %7d %7d %8s %10d %10s" % (r["label"][:12], r["target"][:28], r["n"], r["fail"],
+                                                    r["loss_pct"], r["max_streak"], r["avg"]))
+    print("\n结论：%s" % st["verdict"])
+    for n in st["notes"]:
+        print("  " + n)
+    if st["summary_csv"]:
+        print("汇总：%s" % os.path.join(out_dir, st["summary_csv"]))
+    return 0 if not any(r["fail"] for r in st["rows"]) else 1
+
+
 def run_selftest():
     """--selftest：在临时目录造演示数据，启动真实的 OPC UA 服务，用客户端读一遍。
     不碰 config.json，不占用 4840 端口。通过返回 0，失败返回 1。"""
@@ -1139,6 +1457,9 @@ def run_selftest():
         normalize_config(cfg, tmp)
         logging.getLogger().setLevel(logging.ERROR)
         ok, msg = asyncio.run(_selftest_async(cfg, port))
+        if ok:
+            ok2, msg2 = _selftest_web(tmp)
+            ok, msg = ok2, msg + "；" + msg2
     except Exception as e:  # noqa
         ok, msg = False, "%s: %s" % (type(e).__name__, e)
     finally:
@@ -1183,11 +1504,58 @@ def normalize_config(cfg, base_dir):
     if sec not in ("none", "sign", "sign_encrypt"):
         raise ConfigError("security 只能是 none / sign / sign_encrypt，当前为：%r" % sec)
     cfg["security"] = sec
+    wh = str(cfg.get("web_https", "auto")).lower()
+    if wh not in ("auto", "on", "off"):
+        raise ConfigError("web_https 只能是 auto / on / off，当前为：%r" % wh)
+    cfg["web_https"] = wh
+    hook = str(cfg.get("alert_webhook") or "").strip()
+    if hook and not hook.lower().startswith("https://"):
+        raise ConfigError("alert_webhook 必须以 https:// 开头（告警内容不应明文传输），当前为：%r" % hook[:60])
+    cfg["alert_webhook"] = hook
+    ss = str(cfg.get("smtp_security") or "ssl").lower()
+    if ss not in ("ssl", "starttls", "none"):
+        raise ConfigError("smtp_security 只能是 ssl / starttls / none，当前为：%r" % ss)
+    cfg["smtp_security"] = ss
+    try:
+        import probes as _probes
+        cfg["alert_probes"] = _probes.normalize_probes(cfg.get("alert_probes"))
+    except ValueError as e:
+        raise ConfigError("alert_probes：%s" % e)
+    try:
+        cfg["alert_channel_rules"] = alerts.normalize_channel_rules(cfg.get("alert_channel_rules"))
+    except ValueError as e:
+        raise ConfigError("alert_channel_rules：%s" % e)
+    try:
+        cfg["alert_quiet"] = alerts.normalize_quiet(cfg.get("alert_quiet"))
+    except ValueError as e:
+        raise ConfigError("alert_quiet：%s" % e)
+    for k in ("alert_webhook_level", "alert_email_level"):
+        v = str(cfg.get(k) or "all").lower()
+        if v not in alerts.LEVEL_CHOICES:
+            raise ConfigError("%s 只能是 all / critical / off，当前为：%r" % (k, v))
+        cfg[k] = v
+    try:
+        alerts.parse_recipients(cfg.get("alert_email_to"))
+    except ValueError as e:
+        raise ConfigError("alert_email_to：%s" % e)
+    for k in ("smtp_host", "smtp_user", "smtp_from"):
+        v = str(cfg.get(k) or "").strip()
+        if any(c in v for c in "\r\n"):
+            raise ConfigError("%s 不能包含换行" % k)
+        cfg[k] = v
+    if cfg["smtp_from"] and not alerts.EMAIL_RE.match(cfg["smtp_from"]):
+        raise ConfigError("smtp_from 不是有效的邮箱地址：%r" % cfg["smtp_from"])
+    if cfg["smtp_user"] and ss == "none":
+        raise ConfigError("smtp_security=none 时不能配置 smtp_user：密码会明文传输。请改用 ssl 或 starttls。")
+    if bool(cfg.get("web_cert_file")) != bool(cfg.get("web_key_file")):
+        raise ConfigError("web_cert_file 和 web_key_file 必须同时填写（或都留空自动生成）")
     for key, lo, hi in (("poll_seconds", 5, 3600), ("last_n", 1, 100),
                         ("max_points", 100, 200000), ("max_connections", 1, 200),
                         ("export_min_interval_sec", 0, 3600), ("log_max_mb", 1, 100),
                         ("log_backups", 0, 20), ("max_trace_points", 1000, 5000000),
-                        ("max_file_mb", 1, 2048)):
+                        ("max_file_mb", 1, 2048), ("web_port", 1, 65535),
+                        ("alert_stale_minutes", 0, 100000), ("alert_scan_errors", 0, 1000),
+                        ("smtp_port", 1, 65535), ("env_check_hours", 0, 168)):
         _clamp_int(cfg, key, lo, hi)
     dirs = cfg.get("watch_dirs") or []
     if isinstance(dirs, str):
@@ -1244,6 +1612,17 @@ def security_report(cfg):
             out.append(("注意", "未启用客户端证书白名单：把可信客户端的证书放进 %s 即可启用。" % tdir))
     if host in ("0.0.0.0", "::", ""):
         out.append(("注意", "监听所有网卡（0.0.0.0）。如只给某一块网卡使用，请把 endpoint 改成该网卡 IP，并在防火墙限制来源地址。"))
+    if str(cfg.get("smtp_password") or "").startswith("b64:"):
+        out.append(("注意", "SMTP 密码只做了简单编码（非 Windows 系统无法用系统加密），请限制 config.json 的访问权限。"))
+    if cfg.get("smtp_host") and cfg.get("smtp_security") == "none":
+        out.append(("注意", "告警邮件使用未加密连接（smtp_security=none），只适合内网免登录中继。"))
+    if cfg.get("web_ui", True):
+        wh_host = str(cfg.get("web_host") or "127.0.0.1")
+        if wh_host not in ("127.0.0.1", "localhost", "::1"):
+            if cfg.get("web_https", "auto") == "off":
+                out.append(("风险", "设置页面对外开放（%s）但关闭了 HTTPS：登录密码会明文传输。请把 web_https 改为 auto 或 on。" % wh_host))
+            else:
+                out.append(("注意", "设置页面对外开放（%s），已启用 HTTPS 和账号登录。建议在防火墙限制来源地址。" % wh_host))
     if cfg.get("remote_export", True):
         out.append(("注意", "允许远程调用 ExportCSV（已限流 %s 秒/次）。不需要可设 remote_export=false。"
                     % cfg.get("export_min_interval_sec")))
@@ -1383,6 +1762,29 @@ def main(argv=None):
                     help="自检：造演示数据、启动服务、用客户端读一遍（不影响现有配置）")
     ap.add_argument("--config", default=None, help="配置文件（默认：程序目录 config.json）")
     ap.add_argument("--gui", action="store_true", help="打开图形监控窗口")
+    ap.add_argument("--background", action="store_true",
+                    help="后台静默运行：不显示任何窗口，日志只写 logs\\server.log；同一台电脑只运行一个实例")
+    ap.add_argument("--status", action="store_true", help="查看后台服务是否在运行")
+    ap.add_argument("--install-service", action="store_true",
+                    help="注册为 Windows 服务（管理员）：开机自动启动、崩溃自动重启，可在 services.msc 里启停")
+    ap.add_argument("--uninstall-service", action="store_true", help="停止并删除 Windows 服务（管理员）")
+    ap.add_argument("--start-service", action="store_true", help="启动 Windows 服务（管理员）")
+    ap.add_argument("--stop-service", action="store_true", help="停止 Windows 服务（管理员）")
+    ap.add_argument("--service-status", action="store_true", help="查看 Windows 服务状态")
+    ap.add_argument("--service", action="store_true", help=argparse.SUPPRESS)   # 仅供 Windows 服务管理器调用
+    ap.add_argument("--stop", action="store_true", help="让后台服务正常停止（20 秒没停才强制结束）")
+    ap.add_argument("--settings", action="store_true", help="只打开浏览器设置页面（不启动服务）")
+    ap.add_argument("--stability", nargs="+", metavar="参数",
+                    help="长时间稳定性测试，参数同 --nettest，另加 interval=秒 minutes=分钟，例如："
+                         "--stability modbus_rtu port=COM3 baud=9600 unit=1 interval=1 minutes=60")
+    ap.add_argument("--stability-multi", nargs="+", metavar="参数",
+                    help="多目标稳定性测试：--stability-multi 目标.json [interval=秒] [minutes=分钟]；"
+                         '目标.json 例如 [{"label":"GC-1","kind":"modbus_rtu","params":{"port":"COM3","unit":1}}, ...]')
+    ap.add_argument("--drivercheck", action="store_true", help="驱动与软件环境检测（串口驱动、运行库、防火墙、自启任务、数据目录）")
+    ap.add_argument("--nettest", nargs="+", metavar="参数",
+                    help="连接测试，例如：--nettest ping 192.168.1.10 / --nettest tcp 192.168.1.10 4840 / "
+                         "--nettest serial_list / --nettest modbus_rtu port=COM3 baud=9600 unit=1 "
+                         "（类型：ping tcp dns interfaces opcua modbus_tcp serial_list serial loopback modbus_rtu）")
     ap.add_argument("--extract", nargs="+", metavar="源",
                     help="命令行导出 CSV（源可以是 *_V3.db / *.mbd / 文件夹）")
     ap.add_argument("-o", "--out", default="谱图导出", help="导出文件夹")
@@ -1403,8 +1805,34 @@ def main(argv=None):
     if args.selftest:
         return run_selftest()
 
+    if args.nettest:
+        return run_nettest_cli(args.nettest)
+    if args.stability:
+        return run_stability_cli(args.stability)
+    if args.stability_multi:
+        return run_stability_multi_cli(args.stability_multi)
+
     base_dir = program_dir()
     cfg_path = args.config or os.path.join(base_dir, "config.json")
+
+    if args.install_service or args.uninstall_service or args.start_service or args.stop_service \
+            or args.service_status:
+        return service_cli(args)
+
+    if args.status or args.stop:
+        import bgrun
+        if args.stop:
+            ok, msg = bgrun.request_stop(base_dir)
+            print(msg)
+            return 0 if ok else 1
+        running, st, msg = bgrun.read_status(base_dir)
+        print(msg)
+        if st:
+            for k, label in (("version", "版本"), ("endpoint", "OPC UA"), ("web", "设置页面"),
+                             ("heartbeat", "最近心跳"), ("log", "日志")):
+                if st.get(k):
+                    print("  %s：%s" % (label, st[k]))
+        return 0 if running else 3
 
     if args.admin or args.harden or args.add_user or args.remove_user or args.list_users:
         try:
@@ -1468,6 +1896,20 @@ def main(argv=None):
         print("配置有误（%s）：\n  %s" % (cfg_path, e))
         return 2
 
+    if args.settings:
+        return run_settings_only(cfg)
+
+    if args.drivercheck:
+        import drivercheck
+        r = drivercheck.run_all(cfg)
+        icons = {"正常": "[ 正常 ]", "注意": "[ 注意 ]", "问题": "[ 问题 ]"}
+        print("驱动与软件环境检测：%s（%d ms）" % (r["summary"], r["elapsed_ms"]))
+        for it in r["items"]:
+            print("  %s %s：%s" % (icons[it["level"]], it["name"], it["text"]))
+            if it["fix"]:
+                print("           处理：%s" % it["fix"])
+        return 0 if r["ok"] else 1
+
     if args.check_security:
         print_security_report(cfg)
         return 0
@@ -1480,28 +1922,131 @@ def main(argv=None):
         chrom_core.extract(args.extract, args.out, last=args.last)
         return 0
 
-    setup_logging(cfg, base_dir)
-    get_log().info("色谱提取 OPC UA 服务 v%s 启动，配置：%s", __version__, cfg_path)
+    # Windows 服务管理器启动：交给服务宿主，内部按后台模式运行
+    if args.service:
+        return run_windows_service(cfg, base_dir, cfg_path)
+    return serve(cfg, base_dir, cfg_path, mode="background" if args.background else ("gui" if args.gui else "console"))
+
+
+def service_cli(args):
+    import winservice
+    exe = sys.executable if getattr(sys, "frozen", False) else None
+    try:
+        if args.service_status:
+            info = winservice.query()
+            print(winservice.describe(info))
+            if info and info.get("path"):
+                print("  程序：%s" % info["path"])
+            return 0 if info and info["state"] == 4 else 3
+        if not winservice.is_admin():
+            print("需要管理员权限：请右键“以管理员身份运行”（或在管理员命令行里执行）。")
+            return 5
+        if args.install_service:
+            if exe is None:
+                print("请用打包好的 ChromExtractOPC.exe 注册服务（源码运行时没有可执行文件）。")
+                return 2
+            import bgrun
+            running, st, _ = bgrun.read_status(program_dir())
+            if running and (st or {}).get("mode") != "service":
+                # 已有手动/计划任务启动的后台实例：先停掉，否则服务因单实例启动失败
+                print("检测到后台服务正在运行，先停止它……")
+                print("  " + bgrun.request_stop(program_dir())[1])
+            for line in winservice.install(exe):
+                print("  ✓ " + line)
+            print(winservice.start())
+            print(winservice.describe(winservice.query()))
+            return 0
+        if args.uninstall_service:
+            print(winservice.uninstall())
+            return 0
+        if args.start_service:
+            print(winservice.start())
+            return 0
+        print(winservice.stop())
+        return 0
+    except winservice.ServiceError as e:
+        print("操作失败：%s" % e)
+        return 1
+
+
+def serve(cfg, base_dir, cfg_path, mode="console", ctl=None):
+    """运行服务直到停止。mode：console / background / gui / service。
+    ctl：服务模式下传入 {"started": Event}，返回前会放入 "stop"（线程安全的停止函数）。"""
+    background = mode in ("background", "service")
+    # 同一台电脑只允许一个实例，避免抢端口、重复告警
+    import bgrun
+    instance = bgrun.SingleInstance(base_dir)
+    if not instance.acquire():
+        setup_logging(cfg, base_dir, console=not background)
+        get_log().warning("服务已经在运行（同一台电脑只运行一个实例），本次启动已退出。"
+                          "查看状态：ChromExtractOPC.exe --status")
+        _, st, _ = bgrun.read_status(base_dir)
+        url = (st or {}).get("web") or "http://127.0.0.1:%s/" % cfg.get("web_port", 8840)
+        if mode == "gui":
+            # 后台服务已在运行：窗口模式不再另起一个服务，直接打开设置页面
+            import webbrowser
+            try:
+                webbrowser.open(url)
+            except Exception:  # noqa
+                pass
+        elif mode == "console":
+            print("服务已经在运行（后台）。设置页面：%s" % url)
+        # Windows 服务：另一个实例（如手动后台启动的）占着，服务这次启动失败，由 SCM 记录
+        return 5 if mode == "service" else 0
+    if mode == "background":
+        bgrun.go_silent()
+    if background:
+        cfg["_background"] = True
+    setup_logging(cfg, base_dir, console=not background)
+    get_log().info("色谱提取 OPC UA 服务 v%s 启动（%s），配置：%s", __version__,
+                   {"background": "后台静默", "service": "Windows 服务", "gui": "窗口"}.get(mode, "控制台"), cfg_path)
     for lv, msg in security_report(cfg):
         if lv != "正常":
             get_log().warning("安全提示[%s]：%s", lv, msg)
     for w in watch_dir_warnings(cfg):
         get_log().warning("数据目录提示：%s", w)
-    if args.gui:
-        run_gui(cfg)
+    if mode == "gui":
+        try:
+            run_gui(cfg)
+        finally:
+            instance.release()
         return 0
+    web_srv = start_web_settings(cfg)
+    if web_srv is not None:
+        cfg["_web_url"] = web_srv.url()
 
     async def _run():
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
-        import signal
-        for sig in ("SIGINT", "SIGTERM"):
-            if hasattr(signal, sig):
+        request_stop = lambda: loop.call_soon_threadsafe(stop.set)   # noqa: E731
+        if ctl is not None:
+            ctl["stop"] = request_stop
+        web = cfg.get("_web_url") or "http://127.0.0.1:%s/" % cfg.get("web_port", 8840)
+        keeper = bgrun.StatusKeeper(base_dir, {
+            "version": __version__, "endpoint": cfg["endpoint"], "web": web, "mode": mode,
+            "log": os.path.join(base_dir, cfg.get("log_file") or "")},
+            stop_cb=request_stop).start()
+        if mode != "service":
+            import signal
+            for sig in ("SIGINT", "SIGTERM"):
+                if hasattr(signal, sig):
+                    try:
+                        loop.add_signal_handler(getattr(signal, sig), stop.set)
+                    except NotImplementedError:
+                        pass
+        if ctl is not None and ctl.get("started") is not None:
+            ctl["started"].set()
+            if ctl.get("want_stop"):
+                stop.set()
+        try:
+            await run_server(cfg, stop)
+        finally:
+            keeper.close()
+            if web_srv is not None:
                 try:
-                    loop.add_signal_handler(getattr(signal, sig), stop.set)
-                except NotImplementedError:
+                    web_srv.stop()
+                except Exception:  # noqa
                     pass
-        await run_server(cfg, stop)
 
     try:
         asyncio.run(_run())
@@ -1515,12 +2060,37 @@ def main(argv=None):
     except RuntimeError as e:
         get_log().error("服务无法启动：%s", e)
         return 4
+    finally:
+        instance.release()
+    get_log().info("服务已退出（%s）", {"service": "Windows 服务", "background": "后台"}.get(mode, mode))
     return 0
+
+
+def run_windows_service(cfg, base_dir, cfg_path):
+    """由 Windows 服务管理器以 --service 启动。"""
+    import winservice
+    ctl = {"started": threading.Event()}
+
+    def on_stop():
+        ctl["want_stop"] = True    # 还在启动中就被要求停止：服务一起来马上退出
+        fn = ctl.get("stop")
+        if fn is not None:
+            fn()
+    try:
+        return winservice.run_as_service(lambda: serve(cfg, base_dir, cfg_path, mode="service", ctl=ctl),
+                                         on_stop, ctl["started"], log=get_log())
+    except winservice.ServiceError as e:
+        print(e)
+        return 2
 
 
 def _entry():
     """程序入口：统一兜住未预期的错误，并在双击出错时停住窗口。"""
     rc = 0
+    # 安装程序等自动调用时加 --no-pause：出错也不停住等回车（否则隐藏窗口会一直卡住）
+    no_pause = "--no-pause" in sys.argv or "--background" in sys.argv or "--service" in sys.argv
+    if "--no-pause" in sys.argv:
+        sys.argv = [x for x in sys.argv if x != "--no-pause"]
     try:
         rc = main()
     except SystemExit as e:
@@ -1530,7 +2100,14 @@ def _entry():
     except Exception:  # noqa
         import traceback
         tb = traceback.format_exc()
-        print("程序遇到未预期的错误：\n" + tb)
+        try:
+            print("程序遇到未预期的错误：\n" + tb)
+        except Exception:  # noqa  后台模式没有控制台
+            pass
+        try:
+            logging.getLogger("chrom").error("程序遇到未预期的错误，已退出：%s", tb.strip().splitlines()[-1])
+        except Exception:  # noqa
+            pass
         try:
             d = os.path.join(program_dir(), "logs")
             os.makedirs(d, exist_ok=True)
@@ -1539,7 +2116,8 @@ def _entry():
         except Exception:  # noqa
             pass
         rc = 1
-    _pause_before_exit(rc)
+    if not no_pause:
+        _pause_before_exit(rc)
     return rc
 
 
