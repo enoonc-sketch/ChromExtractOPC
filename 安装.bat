@@ -64,11 +64,25 @@ if defined FW call "%DEST%\设置防火墙.bat" "%FW%"
 
 echo.
 echo [5/6] 设置开机自动运行...
-call "%DEST%\安装开机自启.bat"
-
-echo.
-echo [6/6] 现在启动服务...
-schtasks /Run /TN ChromExtractOPC >nul 2>nul
+echo   1 = 注册为 Windows 服务（推荐：services.msc 里可启停，崩溃自动重启）
+echo   2 = 使用计划任务（兼容旧版本）
+echo   3 = 不设置开机自启
+choice /c 123 /n /m "请按 1、2 或 3："
+set "AS=%errorlevel%"
+if "%AS%"=="1" (
+  echo.
+  echo [6/6] 注册服务并启动...
+  "%DEST%\ChromExtractOPC.exe" --no-pause --install-service
+) else if "%AS%"=="2" (
+  "%DEST%\ChromExtractOPC.exe" --no-pause --uninstall-service >nul 2>nul
+  call "%DEST%\安装开机自启.bat"
+  echo.
+  echo [6/6] 现在启动服务...
+  schtasks /Run /TN ChromExtractOPC >nul 2>nul
+) else (
+  echo.
+  echo [6/6] 已跳过开机自启。需要时双击 后台启动.bat 启动服务。
+)
 echo.
 echo ============================================
 echo   安装完成。

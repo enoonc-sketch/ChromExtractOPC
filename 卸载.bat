@@ -12,6 +12,10 @@ echo 将停止服务，并删除开机自启任务和防火墙规则。
 echo 程序文件夹、配置、日志和证书不会被删除，需要的话请手动删。
 pause
 schtasks /End /TN ChromExtractOPC >nul 2>nul
+if exist "%~dp0ChromExtractOPC.exe" "%~dp0ChromExtractOPC.exe" --no-pause --uninstall-service
+sc stop ChromExtractOPC >nul 2>nul
+sc delete ChromExtractOPC >nul 2>nul
+if exist "%~dp0ChromExtractOPC.exe" "%~dp0ChromExtractOPC.exe" --no-pause --stop
 taskkill /IM ChromExtractOPC.exe /F >nul 2>nul
 if exist "%~dp0install_autostart.ps1" (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_autostart.ps1" -Remove
