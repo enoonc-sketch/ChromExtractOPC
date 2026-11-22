@@ -163,9 +163,6 @@ begin
     '留空 = 稍后在设置页面里再选。升级安装时留空会保留原来的设置。', False, '');
   DataPage.Add('数据文件夹：');
   DataPage.Values[0] := '';
-  { DIAG #10: silent install only - give the data page an existing default path to test whether the empty value is what the wizard validation rejects; interactive installs still start empty }
-  if WizardSilent then
-    DataPage.Values[0] := 'C:\Windows\Temp';
 
   FwPage := CreateInputQueryPage(DataPage.ID, '防火墙',
     '只允许指定的客户端访问 OPC UA 端口 4840（强烈建议）',
@@ -173,6 +170,14 @@ begin
     '  192.168.1.0/24' + #13#10 + '  192.168.1.20,192.168.1.21' + #13#10 +
     '留空 = 不修改防火墙（之后可运行 设置防火墙.bat）。');
   FwPage.Add('允许访问的地址：', False);
+end;
+
+{ 静默安装时跳过数据文件夹页：留空=稍后在设置页面里再选；向导框架层校验不认空值，走到该页就中止安装 }
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (PageID = DataPage.ID) and WizardSilent then
+    Result := True;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
