@@ -60,6 +60,10 @@ def _force_utf8_stdout():
             pass
 
 
+# 导入时就切到 UTF-8：测试直接调 run_selftest() 时不经过 main()，否则中文 print 在 cp1252 控制台下崩溃。
+_force_utf8_stdout()
+
+
 DEFAULT_CONFIG = {
     "endpoint": "opc.tcp://0.0.0.0:4840/ChromExtract",
     "namespace_uri": "urn:chromextract:opcua",
@@ -992,6 +996,258 @@ class SecurityWindow:
         self._saved(restart=True)
 
 
+class SettingsWindow:
+    """窗口里的"设置"面板：数据目录 / 服务 / 告警推送 / 邮件，与网页设置共用同一校验与写入路径。
+    不需要浏览器。dialogs 提供 ask(标题, 提示, secret=<redacted>) / info(文字) / error(文字) / confirm(文字)，
+    真实界面用 tkinter 对话框，自动测试里换成假的。"""
+
+    LEVELS = (("all", "严重和警告都发"), ("critical", "只发严重告警"), ("off", "不发"))
+    SMTP_MODES = (("ssl", "SSL（一般 465）"), ("starttls", "STARTTLS（一般 587）"),
+                  ("none", "不加密（仅内网中继，25）"))
+
+    def __init__(self, parent, cfg, dialogs, tk=None):
+        import tkinter as _tk
+        from tkinter import filedialog as _fd
+        from tkinter import ttk as _ttk
+        tk = tk or _tk
+        self.cfg, self.path, self.dlg = cfg, cfg["_cfg_path"], dialogs
+        self.tk, self.filedialog, self.ttk = tk, _fd, _ttk
+        self.win = tk.Toplevel(parent)
+        self.win.title("设置 — 色谱提取 OPC UA 服务 v%s" % __version__)
+        _set_window_icon(self.win)
+        self.win.geometry("720x560")
+        self.entries, self.vars, self.opt_maps = {}, {}, {}
+        nb = _ttk.Notebook(self.win)
+        nb.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+        self._build_dirs_tab(nb)
+        self._build_service_tab(nb)
+        self._build_alerts_tab(nb)
+        self._build_smtp_tab(nb)
+        bar = tk.Frame(self.win)
+        bar.pack(fill="x", padx=10, pady=8)
+        self.note = tk.Label(bar, text="", anchor="w", justify="left", fg="#555", wraplength=480)
+        self.note.pack(side="left", fill="x", expand=True)
+        tk.Button(bar, text="保存", command=self.save).pack(side="right", padx=4)
+        tk.Button(bar, text="关闭", command=self.win.destroy).pack(side="right")
+        self._fill()
+
+    # ---- 界面搭建 ----
+    def _row(self, parent, label, name, width=48, hint=""):
+        tk = self.tk
+        f = tk.Frame(parent)
+        f.pack(fill="x", padx=10, pady=3)
+        tk.Label(f, text=label, width=16, anchor="w").pack(side="left")
+        e = tk.Entry(f, width=width)
+        e.pack(side="left", fill="x", expand=True)
+        self.entries[name] = e
+        if hint:
+            tk.Label(f, text=hint, fg="#777").pack(side="left", padx=6)
+        return e
+
+    def _opt_row(self, parent, label, name, options, hint=""):
+        tk = self.tk
+        f = tk.Frame(parent)
+        f.pack(fill="x", padx=10, pady=3)
+        tk.Label(f, text=label, width=16, anchor="w").pack(side="left")
+        labels = [lb for _, lb in options]
+        self.opt_maps[name] = {lb: v for v, lb in options}
+        var = tk.StringVar(value=labels[0])
+        self.vars[name] = var
+        tk.OptionMenu(f, var, *labels).pack(side="left")
+        if hint:
+            tk.Label(f, text=hint, fg="#777").pack(side="left", padx=6)
+
+    def _section(self, parent, text):
+        tk = self.tk
+        tk.Label(parent, text=text, anchor="w", font=("Microsoft YaHei", 11, "bold")).pack(
+            fill="x", padx=10, pady=(10, 0))
+
+    def _build_dirs_tab(self, nb):
+        tk = self.tk
+        tab = tk.Frame(nb)
+        nb.add(tab, text="数据目录")
+        self._section(tab, "监控目录（数据文件夹）")
+        self.dirs_lb = tk.Listbox(tab, height=8, exportselection=False)
+        self.dirs_lb.pack(fill="both", expand=True, padx=10, pady=4)
+        bar = tk.Frame(tab)
+        bar.pack(fill="x", padx=10, pady=4)
+        tk.Button(bar, text="添加…", command=self.add_dir).pack(side="left", padx=4)
+        tk.Button(bar, text="删除选中", command=self.remove_dir).pack(side="left", padx=4)
+        tk.Label(tab, text="只认已存在的文件夹（放 *_V3.db / .mbd 文件的地方）；改动下一轮扫描生效。",
+                 anchor="w", justify="left", fg="#555", wraplength=680).pack(fill="x", padx=10, pady=4)
+
+    def _build_service_tab(self, nb):
+        tk = self.tk
+        tab = tk.Frame(nb)
+        nb.add(tab, text="服务")
+        self._section(tab, "OPC UA 服务")
+        self._row(tab, "监听地址 endpoint", "endpoint", hint="需重启")
+        self._row(tab, "服务名称", "server_name", hint="需重启")
+        self._row(tab, "扫描周期（秒）", "poll_seconds")
+        self._row(tab, "每流路保留周期数", "last_n")
+        tk.Label(tab, text="监听地址如 opc.tcp://0.0.0.0:4840/ChromExtract；改监听地址或服务名称后请重启服务。",
+                 anchor="w", justify="left", fg="#555", wraplength=680).pack(fill="x", padx=10, pady=8)
+
+    def _build_alerts_tab(self, nb):
+        tk = self.tk
+        tab = tk.Frame(nb)
+        nb.add(tab, text="告警推送")
+        self._section(tab, "告警推送")
+        self._row(tab, "群机器人推送地址", "alert_webhook")
+        self._opt_row(tab, "推送级别", "alert_webhook_level", self.LEVELS)
+        self._row(tab, "告警收件邮箱", "alert_email_to")
+        self._opt_row(tab, "邮件级别", "alert_email_level", self.LEVELS)
+        self._row(tab, "多久无新周期告警（分）", "alert_stale_minutes")
+        self._row(tab, "连续扫描出错几次告警", "alert_scan_errors")
+        bar = tk.Frame(tab)
+        bar.pack(fill="x", padx=10, pady=8)
+        tk.Button(bar, text="发送测试推送", command=self.test_webhook).pack(side="left", padx=4)
+        tk.Label(tab, text="测试用的是已保存的配置：改完请先点“保存”，再测试。",
+                 anchor="w", justify="left", fg="#555", wraplength=680).pack(fill="x", padx=10, pady=4)
+
+    def _build_smtp_tab(self, nb):
+        tk = self.tk
+        tab = tk.Frame(nb)
+        nb.add(tab, text="邮件")
+        self._section(tab, "发告警邮件（SMTP）")
+        self._row(tab, "SMTP 服务器", "smtp_host")
+        self._row(tab, "端口", "smtp_port")
+        self._opt_row(tab, "加密方式", "smtp_security", self.SMTP_MODES)
+        self._row(tab, "用户名", "smtp_user")
+        self._row(tab, "发件人地址", "smtp_from")
+        bar = tk.Frame(tab)
+        bar.pack(fill="x", padx=10, pady=6)
+        self.smtp_pw_state = tk.Label(bar, text="", anchor="w")
+        self.smtp_pw_state.pack(side="left")
+        tk.Button(bar, text="设置 SMTP 密码…", command=self.set_smtp_password).pack(side="right", padx=4)
+        tk.Button(bar, text="发送测试邮件", command=self.test_email).pack(side="right", padx=4)
+
+    # ---- 读写 ----
+    def _current(self):
+        import config_tools
+        raw = config_tools.read_raw(self.path)
+        view = dict(DEFAULT_CONFIG)
+        view.update(raw)
+        return view
+
+    def _fill(self):
+        cur = self._current()
+        for name, e in self.entries.items():
+            e.delete(0, "end")
+            e.insert(0, str(cur.get(name) if cur.get(name) is not None else ""))
+        for name, var in self.vars.items():
+            rev = {v: lb for lb, v in self.opt_maps[name].items()}
+            var.set(rev.get(cur.get(name), list(self.opt_maps[name])[0]))
+        self.dirs_lb.delete(0, "end")
+        for d in cur.get("watch_dirs") or []:
+            self.dirs_lb.insert("end", d)
+        self._refresh_smtp_state()
+
+    def _refresh_smtp_state(self):
+        import config_tools
+        raw = config_tools.read_raw(self.path)
+        self.smtp_pw_state.config(
+            text="SMTP 密码：已设置" if raw.get("smtp_password") else "SMTP 密码：未设置")
+
+    def _collect(self):
+        values = {}
+        for name, e in self.entries.items():
+            values[name] = e.get().strip()
+        for name in ("poll_seconds", "last_n", "alert_stale_minutes", "alert_scan_errors",
+                     "smtp_port"):
+            try:
+                values[name] = int(values[name])
+            except (TypeError, ValueError):
+                raise ValueError("%s 必须是整数。" % name)
+        for name, var in self.vars.items():
+            values[name] = self.opt_maps[name][var.get()]
+        values["watch_dirs"] = list(self.dirs_lb.get(0, "end"))
+        return values
+
+    def _validated_cfg(self):
+        import config_tools
+        raw = config_tools.read_raw(self.path)
+        cfg = load_config(None)
+        cfg.update(raw)
+        cfg["_base_dir"] = self.cfg.get("_base_dir") or program_dir()
+        normalize_config(cfg, cfg["_base_dir"])
+        return cfg
+
+    # ---- 操作 ----
+    def add_dir(self):
+        d = self.filedialog.askdirectory(parent=self.win, title="选择数据文件夹")
+        if d and d not in self.dirs_lb.get(0, "end"):
+            self.dirs_lb.insert("end", d)
+
+    def remove_dir(self):
+        sel = self.dirs_lb.curselection()
+        if sel:
+            self.dirs_lb.delete(sel[0])
+
+    def save(self):
+        import config_tools
+        try:
+            changed, _restart, msg = apply_settings(self.path, self._collect())
+        except config_tools.ConfigToolError as e:
+            self.dlg.error(str(e))
+            return
+        except ValueError as e:
+            self.dlg.error(str(e))
+            return
+        self.note.config(text=msg)
+        self.dlg.info(msg)
+        self._fill()
+
+    def set_smtp_password(self):
+        import config_tools
+        pw = self.dlg.ask("SMTP 密码", "输入 SMTP 密码或授权码（留空 = 清除已保存的密码）：", secret=True)
+        if pw is None:
+            return
+        if pw == "":
+            if not self.dlg.confirm("确定清除已保存的 SMTP 密码吗？"):
+                return
+            config_tools.set_smtp_password(self.path, "")
+            self._refresh_smtp_state()
+            self.dlg.info("SMTP 密码已清除。")
+            return
+        pw2 = self.dlg.ask("SMTP 密码", "再输入一次确认：", secret=True)
+        if pw2 is None:
+            return
+        if pw != pw2:
+            self.dlg.error("两次输入的密码不一致。")
+            return
+        config_tools.set_smtp_password(self.path, pw)
+        self._refresh_smtp_state()
+        self.dlg.info("SMTP 密码已加密保存。")
+
+    def test_webhook(self):
+        import alerts as _al
+        import config_tools
+        try:
+            cfg = self._validated_cfg()
+            if not cfg.get("alert_webhook"):
+                raise config_tools.ConfigToolError("请先填写并保存告警推送地址。")
+            catch = _NotifyCatch()
+            _al.make_webhook_notifier(cfg, catch).send(
+                "[%s] 这是一条测试消息，收到说明告警推送已配置好。" % (cfg.get("server_name") or "色谱提取 OPC UA 服务"))
+            if catch.err:
+                raise config_tools.ConfigToolError("发送失败：%s" % catch.err)
+            self.dlg.info("测试消息已发送，请到群里确认是否收到。")
+        except config_tools.ConfigToolError as e:
+            self.dlg.error(str(e))
+        except Exception as e:  # noqa
+            self.dlg.error("发送失败：%s" % e)
+
+    def test_email(self):
+        import alerts as _al
+        try:
+            cfg = self._validated_cfg()
+            _al.send_email(cfg, "[测试] %s 告警邮件" % (cfg.get("server_name") or "色谱提取 OPC UA 服务"),
+                           "这是一封测试邮件。收到说明告警邮件已配置好。\n\n收件人：%s" % cfg.get("alert_email_to"))
+            self.dlg.info("测试邮件已发送到 %s，请查收（也看看垃圾邮件箱）。" % cfg.get("alert_email_to"))
+        except Exception as e:  # noqa
+            self.dlg.error("发送失败：%s" % e)
+
 class _TkDialogs:
     def __init__(self, parent):
         from tkinter import messagebox, simpledialog
@@ -1049,21 +1305,27 @@ def start_web_settings(cfg, open_browser=False):
         return None
 
 
-def run_settings_only(cfg):
-    """只打开设置页面（不启动 OPC UA 服务），按 Ctrl+C 或关闭窗口结束。"""
-    cfg = dict(cfg, web_ui=True)
-    ws = start_web_settings(cfg, open_browser=True)
-    if ws is None:
-        return 3
-    print("设置页面已打开：%s\n（浏览器没自动打开就手动复制这个地址；改完关闭本窗口即可）" % ws.url())
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    ws.stop()
-    return 0
+def open_settings_window(cfg):
+    """打开原生设置窗口并等它关闭（不启动服务、不打开浏览器）。"""
+    import tkinter as tk
+    cfg = dict(cfg)
+    cfg.setdefault("_base_dir", program_dir())
+    cfg.setdefault("_cfg_path", os.path.join(cfg["_base_dir"], "config.json"))
+    root = tk.Tk()
+    root.withdraw()
+    _set_window_icon(root)
+    win = SettingsWindow(root, cfg, _TkDialogs(root))
+    win.win.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.mainloop()
 
+def run_settings_only(cfg):
+    """只打开原生设置窗口（不启动 OPC UA 服务、不打开浏览器），关闭窗口即结束。"""
+    try:
+        open_settings_window(cfg)
+    except Exception as e:  # noqa  无图形环境时给一句明白话
+        print("打不开设置窗口（需要图形界面）：%s" % e)
+        return 3
+    return 0
 
 def _resource(rel):
     """打包后资源在 PyInstaller 解压目录（sys._MEIPASS），源码运行时在程序目录。"""
@@ -1098,15 +1360,8 @@ def run_gui(cfg):
     tk.Label(bar, textvariable=sec_var, anchor="w").pack(side="left")
     tk.Button(bar, text="安全设置…",
               command=lambda: SecurityWindow(root, cfg, _TkDialogs(root))).pack(side="right")
-    web = {}
-
-    def open_web():
-        import webbrowser
-        ws = web.get("srv") or start_web_settings(dict(cfg, web_ui=True))
-        if ws is not None:
-            web["srv"] = ws
-            webbrowser.open(ws.url())
-    tk.Button(bar, text="打开设置页面…", command=open_web).pack(side="right", padx=4)
+    tk.Button(bar, text="设置…",
+              command=lambda: SettingsWindow(root, cfg, _TkDialogs(root))).pack(side="right", padx=4)
     box = scrolledtext.ScrolledText(root, state="disabled")
     box.pack(fill="both", expand=True, padx=10, pady=6)
 
@@ -1160,7 +1415,8 @@ def run_gui(cfg):
             worker_done.set()
 
     threading.Thread(target=server_worker, daemon=True).start()
-    web["srv"] = start_web_settings(cfg)
+    # 网页设置仍按 web_ui 开关起（给远程/脚本用），但窗口里的一切都不依赖它
+    start_web_settings(cfg)
     status.set("运行中：%s" % cfg["endpoint"])
     pump_log()
     refresh_sec()
@@ -1652,6 +1908,46 @@ def load_normalized(cfg_path):
     return cfg
 
 
+def apply_settings(cfg_path, values):
+    """保存设置（窗口与网页共用同一校验与写入路径）。
+    values：要改的键值（只含 EDITABLE 里的项）。返回 (changed, restart, message)，
+    restart 是需要重启服务才会生效的键。校验失败抛 config_tools.ConfigToolError。"""
+    import config_tools
+    base_dir = program_dir()
+
+    def _validate(data):
+        cfg = load_config(None)
+        cfg.update(data)
+        cfg["_base_dir"] = base_dir
+        normalize_config(cfg, base_dir)
+
+    changed = config_tools.update_settings(cfg_path, values, _validate)
+    restart = [k for k in changed if k in RESTART_KEYS or k.startswith("web_")]
+    msg = "已保存：%s。" % ("、".join(changed) if changed else "没有改动")
+    if restart:
+        msg += " 以下项需要重启服务才会生效：%s。" % "、".join(restart)
+    elif changed:
+        msg += " 将在下一轮扫描内自动生效。"
+    return changed, restart, msg
+
+
+class _NotifyCatch:
+    """测试推送时收集错误（与 web_settings._Catch 同款，窗口里用）。"""
+
+    def __init__(self):
+        self.err = None
+
+    def warning(self, fmt, *a):
+        try:
+            self.err = fmt % a if a else fmt
+        except Exception:  # noqa
+            self.err = fmt
+
+    error = warning
+
+    def info(self, *a):
+        pass
+
 def _prompt_password(username):
     """交互式输入密码（两次确认 + 强度检查），最多尝试 3 次。失败返回 None。"""
     for _ in range(3):
@@ -1773,7 +2069,7 @@ def main(argv=None):
     ap.add_argument("--service-status", action="store_true", help="查看 Windows 服务状态")
     ap.add_argument("--service", action="store_true", help=argparse.SUPPRESS)   # 仅供 Windows 服务管理器调用
     ap.add_argument("--stop", action="store_true", help="让后台服务正常停止（20 秒没停才强制结束）")
-    ap.add_argument("--settings", action="store_true", help="只打开浏览器设置页面（不启动服务）")
+    ap.add_argument("--settings", action="store_true", help="只打开设置窗口（不启动服务）")
     ap.add_argument("--stability", nargs="+", metavar="参数",
                     help="长时间稳定性测试，参数同 --nettest，另加 interval=秒 minutes=分钟，例如："
                          "--stability modbus_rtu port=COM3 baud=9600 unit=1 interval=1 minutes=60")
@@ -1983,12 +2279,9 @@ def serve(cfg, base_dir, cfg_path, mode="console", ctl=None):
         _, st, _ = bgrun.read_status(base_dir)
         url = (st or {}).get("web") or "http://127.0.0.1:%s/" % cfg.get("web_port", 8840)
         if mode == "gui":
-            # 后台服务已在运行：窗口模式不再另起一个服务，直接打开设置页面
-            import webbrowser
-            try:
-                webbrowser.open(url)
-            except Exception:  # noqa
-                pass
+            # 后台服务已在运行：窗口模式不再另起一个服务，直接打开原生设置窗口
+            # （改配置不需要浏览器；热加载项下一轮扫描生效，需重启的项会提示）
+            open_settings_window(cfg)
         elif mode == "console":
             print("服务已经在运行（后台）。设置页面：%s" % url)
         # Windows 服务：另一个实例（如手动后台启动的）占着，服务这次启动失败，由 SCM 记录
