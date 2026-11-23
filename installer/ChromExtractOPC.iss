@@ -41,7 +41,7 @@ SignedUninstaller=yes
 #endif
 
 [Languages]
-Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chs"; MessagesFile: "ChineseSimplified.isl"
 
 [Tasks]
 Name: "autostart"; Description: "开机自动在后台运行服务"; GroupDescription: "运行方式："
