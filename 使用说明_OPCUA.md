@@ -282,3 +282,29 @@ ChromExtractOPC.exe --diagnose-485 COM3 --scan-slaves
 按数值是否像真实过程量、两次读数是否稳定打分，给出推荐配型和可直接粘贴的配置片段。
 图形界面里也有「485配型诊断」按钮。试完所有参数都没应答时会明确报未找到，
 并给出接线（A/B、终端电阻）、站号、波特率的排查步骤。
+
+## Modbus Poll 主站测试与 Slave 从站模拟器（v2.8 新增）
+
+桌面窗口「诊断工具」页新增两个区域，功能对标现场常用的 Modbus Poll / Modbus Slave：
+
+- **Modbus Poll 主站测试**：TCP 或 RTU 连接设备，读 01/02/03/04、写 05/06/15/16
+  （写之前弹窗确认目标和数值），可单次执行或连续轮询；寄存器按数据类型
+  （int16/uint16/int32/uint32/float32/float64）× 字节序（ABCD/CDAB/BADC/DCBA）
+  解码显示，每次通讯显示请求/响应报文、耗时和异常码说明。
+- **Modbus Slave 从站模拟器**：TCP 或 RTU 模拟一台从站，四区数据
+  （线圈 / 离散输入 / 保持寄存器 / 输入寄存器）可在界面上读写编辑
+  （寄存器支持按数据类型+字节序输入），带通讯日志。只在点「启动从站」后
+  才监听，默认不启动，状态行明示监听地址。
+
+命令行用法：
+
+```
+ChromExtractOPC.exe --modbus-poll --tcp 192.168.1.10:502 --function 3 --address 0 --count 10
+ChromExtractOPC.exe --modbus-poll --tcp 192.168.1.10:502 --function 3 --address 0 --count 2 --data-type float32 --poll-seconds 1
+ChromExtractOPC.exe --modbus-poll --rtu COM3 --baud 9600 --parity N --function 16 --address 10 --values 123.45 --data-type float32
+ChromExtractOPC.exe --modbus-slave --tcp-port 502 --slave 1
+ChromExtractOPC.exe --modbus-slave --rtu COM3 --baud 9600 --slave 1
+```
+
+注意：485 配型自诊断（--diagnose-485）仍只发读功能码 03/04，不受影响；
+Poll 的写功能是独立入口，写真实设备前请确认地址和数值无误。

@@ -188,7 +188,8 @@ def list_interfaces():
 
 
 def test_opcua(endpoint, username="", password="", timeout=5.0):
-    """连接 OPC UA 服务器（不加密），读服务器状态、时间并浏览 Objects。"""
+    """连接 OPC UA 服务器（不加密），读服务器状态、时间并浏览 Objects；
+    对方是 ChromExtractOPC 服务时再读 Diagnostics 数据传输数据并短订心跳。"""
     import asyncio
     ep = str(endpoint or "").strip()
     if not ep.startswith("opc.tcp://") or len(ep) > 300:
@@ -224,6 +225,53 @@ def test_opcua(endpoint, username="", password="", timeout=5.0):
                 except Exception:  # noqa
                     pass
             details.append("Objects 下有 %d 个节点：%s" % (len(kids), "、".join(names)))
+            # 数据传输数据（v2.7）：对方是 ChromExtractOPC 服务时读 Diagnostics
+            # 传输诊断节点（心跳/通道数/数据年龄/传输状态）并短订心跳数通知；
+            # 不是本服务就明说没有，不瞎报。
+            try:
+                ns = await c.get_namespace_index("urn:chromextract:opcua")
+                diag = await c.nodes.objects.get_child(
+                    ["%d:Chromatograph" % ns, "%d:Diagnostics" % ns])
+                vals = {}
+                for ch in await diag.get_children():
+                    try:
+                        vals[(await ch.read_browse_name()).Name] = await ch.read_value()
+                    except Exception:  # noqa
+                        pass
+                hb1 = vals.get("TestCounter")
+                await asyncio.sleep(1.2)
+                try:
+                    hb2 = await (await diag.get_child(["%d:TestCounter" % ns])).read_value()
+                except Exception:  # noqa
+                    hb2 = None
+                moving = (hb1 is not None and hb2 is not None and hb2 != hb1)
+                details.append(
+                    "数据传输：心跳计数 %s -> %s（%s）；通道 %s 个（Good %s）；"
+                    "总点数 %s；数据年龄 %s 秒；传输状态 %s" % (
+                        hb1, hb2, "在动，数据在传" if moving else "未动",
+                        vals.get("ChannelCount"), vals.get("GoodChannelCount"),
+                        vals.get("TotalPoints"), vals.get("DataAgeSeconds"),
+                        vals.get("TransmissionStatus")))
+                # 短订 TestSignal 3 秒，数通知条数，证明订阅通道活着
+                try:
+                    count = [0]
+
+                    class _H:
+                        def datachange_notification(self, node, val, data):
+                            count[0] += 1
+                    sub = await c.create_subscription(500, _H())
+                    try:
+                        sig = await diag.get_child(["%d:TestSignal" % ns])
+                        await sub.subscribe_data_change(sig)
+                        await asyncio.sleep(3.0)
+                    finally:
+                        await sub.delete()
+                    details.append("订阅心跳 3 秒收到 %d 条通知" % count[0])
+                except Exception:  # noqa
+                    pass
+            except Exception:  # noqa
+                details.append("未找到数据传输诊断节点（对方不是 ChromExtractOPC 服务，"
+                               "或版本低于 2.5；本测试只验证了连接）")
             return _result(True, "OPC UA 连接成功：%s" % ep, details, ms)
         finally:
             await c.disconnect()

@@ -144,6 +144,100 @@ def probe_body(edit_id, label, kind, params, interval, fail_threshold, level, en
             "fail_threshold": fail_threshold, "level": level, "enabled": bool(enabled)}
 
 
+# ---- Modbus Poll / Slave（v2.8）表单参数拼装（纯函数，坏值抛 ValueError） ----
+MODBUS_FUNC_LABELS = ["01 读线圈", "02 读离散输入", "03 读保持寄存器", "04 读输入寄存器",
+                      "05 写单线圈", "06 写单寄存器", "15 写多线圈", "16 写多寄存器"]
+MODBUS_AREA_LABELS = {"线圈": "coils", "离散输入": "discrete", "保持寄存器": "holding", "输入寄存器": "input"}
+MODBUS_DTYPES = ["uint16", "int16", "uint32", "int32", "float32", "float64"]
+MODBUS_ORDERS = ["ABCD", "CDAB", "BADC", "DCBA"]
+
+
+def _mb_int(raw, key, label, lo, hi, default=None):
+    v = str(raw.get(key, "")).strip()
+    if v == "" and default is not None:
+        return default
+    try:
+        n = int(v)
+    except ValueError:
+        raise ValueError("%s 必须是数字" % label)
+    if not lo <= n <= hi:
+        raise ValueError("%s 范围 %d～%d" % (label, lo, hi))
+    return n
+
+
+def _mb_transport(raw):
+    return "rtu" if str(raw.get("transport", "")).strip().lower() in ("rtu", "串口") else "tcp"
+
+
+def _mb_serial(raw):
+    parity = str(raw.get("parity") or "N").strip().upper()[:1]
+    if parity not in ("N", "E", "O"):
+        raise ValueError("校验位只能是 N（无）/ E（偶）/ O（奇）")
+    try:
+        stopbits = float(raw.get("stopbits") or 1)
+    except (TypeError, ValueError):
+        raise ValueError("停止位必须是数字")
+    if stopbits not in (1, 1.5, 2):
+        raise ValueError("停止位只能是 1 / 1.5 / 2")
+    return {"serial": str(raw.get("serial") or "").strip(),
+            "baud": _mb_int(raw, "baud", "波特率", 50, 4000000, 9600),
+            "parity": parity, "stopbits": stopbits}
+
+
+def build_modbus_poll_params(raw):
+    """Modbus Poll 表单原始值 → 参数 dict。"""
+    p = {"transport": _mb_transport(raw),
+         "unit": _mb_int(raw, "unit", "站号", 0, 255, 1),
+         "addr": _mb_int(raw, "addr", "地址", 0, 65535, 0),
+         "count": _mb_int(raw, "count", "数量", 1, 2000, 10),
+         "dtype": str(raw.get("dtype") or "uint16"),
+         "order": str(raw.get("order") or "ABCD").upper(),
+         "values_text": str(raw.get("values") or "")}
+    try:
+        p["func"] = int(str(raw.get("func") or "03").split()[0])
+    except (ValueError, IndexError):
+        raise ValueError("功能码不对")
+    if p["func"] not in (1, 2, 3, 4, 5, 6, 15, 16):
+        raise ValueError("不支持的功能码：%s" % p["func"])
+    if p["dtype"] not in MODBUS_DTYPES:
+        raise ValueError("数据类型只能是：%s" % " / ".join(MODBUS_DTYPES))
+    if p["order"] not in MODBUS_ORDERS:
+        raise ValueError("字节序只能是：%s" % " / ".join(MODBUS_ORDERS))
+    try:
+        p["interval"] = float(raw.get("interval") or 1)
+    except (TypeError, ValueError):
+        raise ValueError("轮询间隔必须是数字（秒）")
+    if p["interval"] < 0.05:
+        raise ValueError("轮询间隔至少 0.05 秒")
+    if p["transport"] == "tcp":
+        p["host"] = str(raw.get("host") or "").strip()
+        if not p["host"]:
+            raise ValueError("请填写目标设备地址")
+        p["port"] = _mb_int(raw, "port", "TCP 端口", 1, 65535, 502)
+    else:
+        p.update(_mb_serial(raw))
+        if not p["serial"]:
+            raise ValueError("请填写串口，例如 COM3")
+    return p
+
+
+def build_modbus_slave_params(raw):
+    """Modbus Slave 表单原始值 → 参数 dict。"""
+    p = {"transport": _mb_transport(raw),
+         "unit": _mb_int(raw, "unit", "站号", 0, 255, 1),
+         "size": _mb_int(raw, "size", "每区大小", 1, 65536, 10000)}
+    if p["transport"] == "tcp":
+        p["host"] = str(raw.get("host") or "0.0.0.0").strip() or "0.0.0.0"
+        p["tcp_port"] = _mb_int(raw, "tcp_port", "监听端口", 0, 65535, 502)
+    else:
+        p.update(_mb_serial(raw))
+        if not p["serial"]:
+            raise ValueError("请填写串口，例如 COM3")
+        if not 1 <= p["unit"] <= 247:
+            raise ValueError("RTU 站号范围 1～247")
+    return p
+
+
 class DesktopLogic:
     """桌面窗口的逻辑层：复用 SettingsServer 的动作与状态方法（不启动 HTTP）。
 
@@ -343,6 +437,14 @@ class DesktopWindow:
         self._closed = True
         try:
             self.logic.stop_stability()
+        except Exception:  # noqa
+            pass
+        try:  # Modbus Poll 轮询与 Slave 从站随窗口关闭一起停
+            if getattr(self, "_mbp_stop", None) is not None:
+                self._mbp_stop.set()
+            if getattr(self, "_mbs_slave", None) is not None:
+                self._mbs_slave.stop()
+                self._mbs_slave = None
         except Exception:  # noqa
             pass
         self.root.destroy()
@@ -1035,6 +1137,158 @@ class DesktopWindow:
         self.nt_out = scrolledtext.ScrolledText(sec, height=7, state="disabled", wrap="word")
         self.nt_out.pack(fill="x", pady=4)
 
+        # ---- Modbus Poll 主站测试（v2.8） ----
+        self._mbp_polling = False
+        self._mbp_stop = None
+        sec = self._section(inner, "Modbus Poll 主站测试")
+        tk.Label(sec, text="像 Modbus Poll 一样读/写设备数据：TCP 或 RTU，读 01/02/03/04，"
+                           "写 05/06/15/16（写之前会弹窗确认目标和数值）。寄存器按数据类型+字节序解码显示，"
+                           "每次通讯显示请求/响应报文和耗时。",
+                 fg="#777", anchor="w", justify="left", wraplength=860).pack(fill="x")
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=3)
+        self.mbp_transport = tk.StringVar(value="TCP")
+        self.mbp_host = tk.StringVar(value="127.0.0.1")
+        self.mbp_port = tk.StringVar(value="502")
+        self.mbp_serial = tk.StringVar(value="COM3")
+        self.mbp_baud = tk.StringVar(value="9600")
+        self.mbp_parity = tk.StringVar(value="N")
+        self.mbp_stopbits = tk.StringVar(value="1")
+        tk.Label(row, text="方式").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbp_transport, values=["TCP", "RTU"],
+                     state="readonly", width=6).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="主机").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_host, width=14).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="TCP端口").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_port, width=6).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="串口").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_serial, width=8).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="波特率").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_baud, width=7).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="校验").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbp_parity, values=["N", "E", "O"],
+                     state="readonly", width=4).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="停止位").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbp_stopbits, values=["1", "1.5", "2"],
+                     state="readonly", width=4).pack(side="left", padx=2)
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=3)
+        self.mbp_unit = tk.StringVar(value="1")
+        self.mbp_func = tk.StringVar(value="03 读保持寄存器")
+        self.mbp_addr = tk.StringVar(value="0")
+        self.mbp_count = tk.StringVar(value="10")
+        self.mbp_dtype = tk.StringVar(value="uint16")
+        self.mbp_order = tk.StringVar(value="ABCD")
+        tk.Label(row, text="站号").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_unit, width=5).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="功能码").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbp_func, values=MODBUS_FUNC_LABELS,
+                     state="readonly", width=16).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="地址").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_addr, width=7).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="数量").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_count, width=6).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="数据类型").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbp_dtype, values=MODBUS_DTYPES,
+                     state="readonly", width=9).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="字节序").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbp_order, values=MODBUS_ORDERS,
+                     state="readonly", width=7).pack(side="left", padx=2)
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=3)
+        self.mbp_values = tk.StringVar(value="")
+        self.mbp_interval = tk.StringVar(value="1")
+        tk.Label(row, text="写入值").pack(side="left")
+        tk.Entry(row, textvariable=self.mbp_values, width=30).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="（逗号分隔；寄存器按数据类型解释，如 float32 填 123.45）", fg="#777").pack(side="left")
+        tk.Label(row, text="轮询间隔(秒)").pack(side="left", padx=(8, 2))
+        tk.Entry(row, textvariable=self.mbp_interval, width=6).pack(side="left")
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=3)
+        tk.Button(row, text="单次执行", command=self._mbp_once).pack(side="left")
+        self.mbp_poll_btn = tk.Button(row, text="开始轮询", command=self._mbp_toggle_poll)
+        self.mbp_poll_btn.pack(side="left", padx=6)
+        tk.Button(row, text="写入（确认后执行）", command=self._mbp_once).pack(side="left")
+        self.mbp_out = scrolledtext.ScrolledText(sec, height=8, state="disabled", wrap="word")
+        self.mbp_out.pack(fill="x", pady=4)
+
+        # ---- Modbus Slave 从站模拟器（v2.8） ----
+        self._mbs_slave = None
+        self._mbs_store = None
+        self._mbs_logs = []
+        self._mbs_log_idx = 0
+        sec = self._section(inner, "Modbus Slave 从站模拟器")
+        tk.Label(sec, text="像 Modbus Slave 一样模拟一台从站设备：TCP 或 RTU，四区数据"
+                           "（线圈 / 离散输入 / 保持寄存器 / 输入寄存器）可编辑，带通讯日志。"
+                           "只在点“启动从站”后才监听，默认不启动；监听地址见状态行。",
+                 fg="#777", anchor="w", justify="left", wraplength=860).pack(fill="x")
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=3)
+        self.mbs_transport = tk.StringVar(value="TCP")
+        self.mbs_host = tk.StringVar(value="0.0.0.0")
+        self.mbs_tcp_port = tk.StringVar(value="502")
+        self.mbs_serial = tk.StringVar(value="COM3")
+        self.mbs_baud = tk.StringVar(value="9600")
+        self.mbs_parity = tk.StringVar(value="N")
+        self.mbs_stopbits = tk.StringVar(value="1")
+        tk.Label(row, text="方式").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbs_transport, values=["TCP", "RTU"],
+                     state="readonly", width=6).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="监听地址").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_host, width=12).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="TCP端口").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_tcp_port, width=6).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="串口").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_serial, width=8).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="波特率").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_baud, width=7).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="校验").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbs_parity, values=["N", "E", "O"],
+                     state="readonly", width=4).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="停止位").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbs_stopbits, values=["1", "1.5", "2"],
+                     state="readonly", width=4).pack(side="left", padx=2)
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=3)
+        self.mbs_unit = tk.StringVar(value="1")
+        self.mbs_size = tk.StringVar(value="10000")
+        tk.Label(row, text="站号").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_unit, width=5).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="每区大小").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_size, width=8).pack(side="left", padx=(2, 8))
+        self.mbs_btn = tk.Button(row, text="启动从站", command=self._mbs_toggle)
+        self.mbs_btn.pack(side="left", padx=6)
+        self.mbs_status = tk.StringVar(value="已停止（默认不监听）")
+        tk.Label(row, textvariable=self.mbs_status, fg="#555").pack(side="left", padx=8)
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=3)
+        self.mbs_area = tk.StringVar(value="保持寄存器")
+        self.mbs_addr = tk.StringVar(value="0")
+        self.mbs_count = tk.StringVar(value="10")
+        self.mbs_value = tk.StringVar(value="")
+        self.mbs_dtype = tk.StringVar(value="uint16")
+        self.mbs_order = tk.StringVar(value="ABCD")
+        tk.Label(row, text="数据区").pack(side="left")
+        ttk.Combobox(row, textvariable=self.mbs_area, values=list(MODBUS_AREA_LABELS),
+                     state="readonly", width=11).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="地址").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_addr, width=7).pack(side="left", padx=(2, 8))
+        tk.Label(row, text="数量").pack(side="left")
+        tk.Entry(row, textvariable=self.mbs_count, width=6).pack(side="left", padx=(2, 8))
+        tk.Button(row, text="读取数据区", command=self._mbs_read_area).pack(side="left", padx=4)
+        tk.Label(row, text="值").pack(side="left", padx=(8, 2))
+        tk.Entry(row, textvariable=self.mbs_value, width=16).pack(side="left", padx=(2, 8))
+        ttk.Combobox(row, textvariable=self.mbs_dtype, values=MODBUS_DTYPES,
+                     state="readonly", width=9).pack(side="left", padx=(2, 4))
+        ttk.Combobox(row, textvariable=self.mbs_order, values=MODBUS_ORDERS,
+                     state="readonly", width=7).pack(side="left", padx=(2, 8))
+        tk.Button(row, text="写入数据区", command=self._mbs_write_area).pack(side="left")
+        self.mbs_area_out = scrolledtext.ScrolledText(sec, height=5, state="disabled", wrap="word")
+        self.mbs_area_out.pack(fill="x", pady=4)
+        tk.Label(sec, text="通讯日志", font=("Microsoft YaHei", 10, "bold")).pack(anchor="w")
+        self.mbs_log = scrolledtext.ScrolledText(sec, height=7, state="disabled", wrap="word")
+        self.mbs_log.pack(fill="x", pady=4)
+
         sec = self._section(inner, "长时间稳定性测试")
         tk.Label(sec, text="用上面同样的参数反复测试，统计丢包率、延迟和错误。支持 Ping / TCP 端口 / DNS / OPC UA / "
                            "Modbus TCP / Modbus RTU / 串口收发；关掉窗口也会在后台继续。",
@@ -1194,6 +1448,222 @@ class DesktopWindow:
             self._show(True, str(msg))
             self._poll_probes_now()
         self._bg(lambda: self.logic.action("probe_save", body), done)
+
+    # ---- Modbus Poll / Slave（v2.8） ----
+    def _mbp_raw(self):
+        return {"transport": self.mbp_transport.get(), "host": self.mbp_host.get(),
+                "port": self.mbp_port.get(), "serial": self.mbp_serial.get(),
+                "baud": self.mbp_baud.get(), "parity": self.mbp_parity.get(),
+                "stopbits": self.mbp_stopbits.get(), "unit": self.mbp_unit.get(),
+                "func": self.mbp_func.get(), "addr": self.mbp_addr.get(),
+                "count": self.mbp_count.get(), "dtype": self.mbp_dtype.get(),
+                "order": self.mbp_order.get(), "values": self.mbp_values.get(),
+                "interval": self.mbp_interval.get()}
+
+    @staticmethod
+    def _mbp_master(p):
+        import modbus_tools as mt
+        if p["transport"] == "tcp":
+            return mt.TcpMaster(p["host"], p["port"], unit=p["unit"], timeout=3.0)
+        return mt.RtuMaster(p["serial"], baud=p["baud"], parity=p["parity"],
+                            stopbits=p["stopbits"], unit=p["unit"], timeout=2.0)
+
+    def _mbp_once(self):
+        import modbus_tools as mt
+        try:
+            p = build_modbus_poll_params(self._mbp_raw())
+        except ValueError as e:
+            return self._show(False, str(e))
+        values = None
+        if p["func"] in mt.WRITE_FUNCS:
+            try:
+                values = mt.parse_values(p["values_text"], p["func"], p["dtype"], p["order"])
+            except Exception as e:  # noqa
+                return self._show(False, str(e))
+            target = ("%s:%s" % (p["host"], p["port"])) if p["transport"] == "tcp" else p["serial"]
+            # 写操作防误点：弹窗确认目标、站号、地址和数值
+            if not self.mb.askyesno(
+                    "确认写入",
+                    "将向 %s 站号 %d 地址 %d 执行%s：\n值 %s\n\n确认写入吗？" % (
+                        target, p["unit"], p["addr"], mt.FUNC_NAMES[p["func"]], p["values_text"]),
+                    parent=self.root):
+                return
+
+        def work():
+            m = self._mbp_master(p)
+            try:
+                m.connect()
+                if p["func"] in mt.WRITE_FUNCS:
+                    r = m.write(p["func"], p["addr"], values)
+                else:
+                    r = m.read(p["func"], p["addr"], p["count"])
+            finally:
+                m.close()
+            r["_addr"], r["_dtype"], r["_order"] = p["addr"], p["dtype"], p["order"]
+            return r
+        self._bg(work, self._mbp_render)
+
+    def _mbp_render(self, result, err):
+        if err is not None:
+            return self._show(False, str(err))
+        import modbus_tools as mt
+        lines = [("✓ " if result["ok"] else "✗ ") + result["summary"]] + list(result["details"])
+        if result["ok"] and result.get("values") is not None:
+            lines += mt.format_read_values(result["values"], result["kind"],
+                                           result.get("_addr", 0), result.get("_dtype", "uint16"),
+                                           result.get("_order", "ABCD"))
+        self._set_text(self.mbp_out, "\n".join(lines))
+
+    def _mbp_toggle_poll(self):
+        if self._mbp_polling:
+            if self._mbp_stop is not None:
+                self._mbp_stop.set()
+            self.mbp_poll_btn.configure(text="开始轮询")
+            return
+        import modbus_tools as mt
+        try:
+            p = build_modbus_poll_params(self._mbp_raw())
+        except ValueError as e:
+            return self._show(False, str(e))
+        if p["func"] in mt.WRITE_FUNCS:
+            return self._show(False, "轮询只用于读功能码；写操作请用“写入（确认后执行）”。")
+        self._mbp_stop = threading.Event()
+        self._mbp_polling = True
+        self.mbp_poll_btn.configure(text="停止轮询")
+
+        def work():
+            m = self._mbp_master(p)
+            try:
+                m.connect()
+
+                def cb(r):
+                    r["_addr"], r["_dtype"], r["_order"] = p["addr"], p["dtype"], p["order"]
+                    self._q.put((self._mbp_render, r, None))
+                mt.poll(m, p["func"], p["addr"], p["count"], interval_sec=p["interval"],
+                        stop_event=self._mbp_stop, callback=cb)
+            except Exception as e:  # noqa
+                self._q.put((self._mbp_render, None, e))
+            finally:
+                m.close()
+                self._q.put((self._mbp_poll_done, None, None))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _mbp_poll_done(self, _result, _err):
+        self._mbp_polling = False
+        try:
+            self.mbp_poll_btn.configure(text="开始轮询")
+        except Exception:  # noqa
+            pass
+
+    def _mbs_raw(self):
+        return {"transport": self.mbs_transport.get(), "host": self.mbs_host.get(),
+                "tcp_port": self.mbs_tcp_port.get(), "serial": self.mbs_serial.get(),
+                "baud": self.mbs_baud.get(), "parity": self.mbs_parity.get(),
+                "stopbits": self.mbs_stopbits.get(), "unit": self.mbs_unit.get(),
+                "size": self.mbs_size.get()}
+
+    def _mbs_store_or_new(self, size):
+        import modbus_tools as mt
+        if self._mbs_store is None or self._mbs_store.size != size:
+            self._mbs_store = mt.DataStore(size=size)
+        return self._mbs_store
+
+    def _mbs_toggle(self):
+        if self._mbs_slave is not None:
+            return self._mbs_stop()
+        import modbus_tools as mt
+        try:
+            p = build_modbus_slave_params(self._mbs_raw())
+        except ValueError as e:
+            return self._show(False, str(e))
+        store = self._mbs_store_or_new(p["size"])
+        self._mbs_logs = []
+        self._mbs_log_idx = 0
+        self._set_text(self.mbs_log, "")
+        try:
+            if p["transport"] == "tcp":
+                slave = mt.TcpSlave(store, host=p["host"], port=p["tcp_port"],
+                                    unit=p["unit"], log=self._mbs_logs.append)
+            else:
+                slave = mt.RtuSlave(store, p["serial"], baud=p["baud"], parity=p["parity"],
+                                    stopbits=p["stopbits"], unit=p["unit"], log=self._mbs_logs.append)
+            slave.start()
+        except Exception as e:  # noqa
+            return self._show(False, str(e))
+        self._mbs_slave = slave
+        self.mbs_status.set("运行中：监听 %s（手动启动，关窗自动停）" % slave.address)
+        self.mbs_btn.configure(text="停止从站")
+        self._mbs_pump()
+
+    def _mbs_stop(self):
+        if self._mbs_slave is not None:
+            try:
+                self._mbs_slave.stop()
+            except Exception:  # noqa
+                pass
+            self._mbs_slave = None
+        self.mbs_status.set("已停止（默认不监听）")
+        try:
+            self.mbs_btn.configure(text="启动从站")
+        except Exception:  # noqa
+            pass
+
+    def _mbs_pump(self):
+        if self._closed or self._mbs_slave is None:
+            return
+        new = []
+        while self._mbs_log_idx < len(self._mbs_logs):
+            e = self._mbs_logs[self._mbs_log_idx]
+            self._mbs_log_idx += 1
+            new.append("[%s] %s 站号 %s 功能码 %s 请求 %s 应答 %s%s" % (
+                e["time"], e["transport"], e["unit"], e["func"], e["req_hex"],
+                e["resp_hex"] or "（无）", ("  " + e["note"]) if e["note"] else ""))
+        if new:
+            self.mbs_log.configure(state="normal")
+            self.mbs_log.insert("end", "\n".join(new) + "\n")
+            self.mbs_log.see("end")
+            self.mbs_log.configure(state="disabled")
+        self.root.after(500, self._mbs_pump)
+
+    def _mbs_read_area(self):
+        import modbus_tools as mt
+        try:
+            p = build_modbus_slave_params(self._mbs_raw())
+            store = self._mbs_store_or_new(p["size"])
+            area = MODBUS_AREA_LABELS[self.mbs_area.get()]
+            addr = _mb_int({"v": self.mbs_addr.get()}, "v", "地址", 0, 65535, 0)
+            count = _mb_int({"v": self.mbs_count.get()}, "v", "数量", 1, 2000, 10)
+            if area in ("coils", "discrete"):
+                vals = store.read_bits(area, addr, count)
+                lines = mt.format_read_values(vals, "位", addr)
+            else:
+                vals = store.read_regs(area, addr, count)
+                lines = mt.format_read_values(vals, "寄存器", addr,
+                                              self.mbs_dtype.get(), self.mbs_order.get())
+        except Exception as e:  # noqa
+            return self._show(False, str(e))
+        self._set_text(self.mbs_area_out, "\n".join(lines))
+
+    def _mbs_write_area(self):
+        import modbus_tools as mt
+        try:
+            p = build_modbus_slave_params(self._mbs_raw())
+            store = self._mbs_store_or_new(p["size"])
+            area = MODBUS_AREA_LABELS[self.mbs_area.get()]
+            addr = _mb_int({"v": self.mbs_addr.get()}, "v", "地址", 0, 65535, 0)
+            if area in ("coils", "discrete"):
+                bits = mt.parse_values(self.mbs_value.get(), 15)
+                store.write_bits(area, addr, bits)
+                msg = "已写入%s 地址 %d 起 %d 个位：%s" % (self.mbs_area.get(), addr, len(bits), bits)
+            else:
+                regs = mt.parse_values(self.mbs_value.get(), 16,
+                                       self.mbs_dtype.get(), self.mbs_order.get())
+                store.write_regs(area, addr, regs)
+                msg = "已写入%s 地址 %d 起 %d 个寄存器：%s" % (
+                    self.mbs_area.get(), addr, len(regs), " ".join("0x%04X" % r for r in regs))
+        except Exception as e:  # noqa
+            return self._show(False, str(e))
+        self._set_text(self.mbs_area_out, msg)
 
     # ---- 驱动检测 ----
     def _dc_run(self):

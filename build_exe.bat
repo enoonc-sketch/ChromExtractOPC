@@ -52,6 +52,7 @@ build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --console 
   --hidden-import config_tools ^
   --hidden-import alerts ^
   --hidden-import nettest ^
+  --hidden-import modbus_tools ^
   --hidden-import stability ^
   --hidden-import probes ^
   --hidden-import drivercheck ^

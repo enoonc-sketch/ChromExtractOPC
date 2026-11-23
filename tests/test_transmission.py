@@ -519,5 +519,26 @@ class DiagnosisIntegration(unittest.TestCase):
         asyncio.run(go())
 
 
+class NettestOpcuaTransmission(unittest.TestCase):
+    """v2.7：连接测试的 OPC UA 项要读出数据传输数据（Diagnostics），不只是连通。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = _Server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.stop()
+
+    def test_opcua_probe_reads_transmission_data(self):
+        import nettest
+        r = nettest.test_opcua(self.srv.url, timeout=10)
+        self.assertTrue(r["ok"], r)
+        text = "\n".join(r.get("details") or [])
+        self.assertIn("数据传输：心跳计数", text)
+        self.assertIn("通道", text)
+        self.assertIn("订阅心跳 3 秒收到", text)
+
+
 if __name__ == "__main__":
     unittest.main()

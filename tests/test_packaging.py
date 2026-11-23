@@ -118,7 +118,7 @@ class ExeBuild(unittest.TestCase):
     def test_hidden_imports(self):
         for f in ("build_exe.bat", ".github/workflows/build-exe.yml"):
             text = open(os.path.join(ROOT, f), encoding="utf-8").read()
-            for mod in ("web_settings", "demo_data", "config_tools", "alerts", "nettest", "stability", "probes", "drivercheck", "envwatch", "bgrun", "winservice"):
+            for mod in ("web_settings", "demo_data", "config_tools", "alerts", "nettest", "stability", "probes", "drivercheck", "envwatch", "bgrun", "winservice", "modbus_tools"):
                 self.assertIn("--hidden-import " + mod, text, f + " 缺少 " + mod)
             self.assertIn("selftest", text)
             self.assertIn("--icon assets\\app.ico", text, f + " 没有设置 EXE 图标")

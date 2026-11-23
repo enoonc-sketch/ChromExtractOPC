@@ -2278,6 +2278,9 @@ def run_rtu485_cli(args):
     """--diagnose-485：自动试参数 + 数据配型，打印结论。只读，不写寄存器。"""
     _force_utf8_stdout()
     import nettest
+    if args.function not in (3, 4):
+        print("[ 失败 ] 485 配型诊断只允许读功能码 03/04（写功能请用 --modbus-poll）")
+        return 2
     try:
         r = nettest.diagnose_rtu485(
             args.diagnose_485, unit=args.slave, func=args.function, addr=args.register,
@@ -2292,6 +2295,108 @@ def run_rtu485_cli(args):
         for sub in str(line).split("\n"):
             print("    " + sub)
     return 0 if r["ok"] else 1
+
+
+def _print_modbus_result(r, addr, dtype, order):
+    import modbus_tools as mt
+    print(("[ 成功 ] " if r["ok"] else "[ 失败 ] ") + r["summary"])
+    for line in r["details"]:
+        print("    " + line)
+    if r["ok"] and r.get("values") is not None:
+        for line in mt.format_read_values(r["values"], r["kind"], addr, dtype, order):
+            print("    " + line)
+
+
+def run_modbus_poll_cli(args):
+    """--modbus-poll：Modbus 主站测试（读 01-04 / 写 05/06/15/16，单次或连续轮询）。"""
+    _force_utf8_stdout()
+    import modbus_tools as mt
+    import nettest
+    timeout = max(0.3, args.timeout_ms / 1000.0)
+    try:
+        if args.tcp:
+            host, _sep, port = str(args.tcp).rpartition(":")
+            if not host:
+                host, port = str(args.tcp), "502"
+            master = mt.TcpMaster(host, int(port or 502), unit=args.slave, timeout=timeout)
+            target = "TCP %s:%s 站号 %d" % (host, port or 502, args.slave)
+        elif args.rtu:
+            master = mt.RtuMaster(args.rtu, baud=args.baud or 9600, parity=args.parity,
+                                  stopbits=args.stopbits, unit=args.slave, timeout=timeout)
+            target = "RTU %s %d,8,%s,%g 站号 %d" % (args.rtu, args.baud or 9600,
+                                                  args.parity, args.stopbits, args.slave)
+        else:
+            print("[ 失败 ] 请指定目标：--tcp 主机:端口 或 --rtu 串口")
+            return 2
+        master.connect()
+    except (nettest.TestError, ValueError) as e:
+        print("[ 失败 ] " + str(e))
+        return 1
+    print("Modbus Poll：%s，功能码 %02d（%s），地址 %d" % (
+        target, args.function, mt.FUNC_NAMES.get(args.function, "?"), args.address))
+    try:
+        if args.function in mt.WRITE_FUNCS:
+            try:
+                values = mt.parse_values(args.values, args.function, args.data_type, args.byte_order)
+            except nettest.TestError as e:
+                print("[ 失败 ] " + str(e))
+                return 2
+            r = master.write(args.function, args.address, values)
+            _print_modbus_result(r, args.address, args.data_type, args.byte_order)
+            return 0 if r["ok"] else 1
+        if args.poll_seconds and args.poll_seconds > 0:
+            print("连续轮询（间隔 %g 秒，Ctrl+C 停止）…" % args.poll_seconds)
+            last = {"ok": False}
+
+            def _show(r):
+                last.update(r)
+                _print_modbus_result(r, args.address, args.data_type, args.byte_order)
+            try:
+                mt.poll(master, args.function, args.address, args.count,
+                        interval_sec=args.poll_seconds, callback=_show)
+            except KeyboardInterrupt:
+                print("已停止轮询。")
+            return 0 if last["ok"] else 1
+        r = master.read(args.function, args.address, args.count)
+        _print_modbus_result(r, args.address, args.data_type, args.byte_order)
+        return 0 if r["ok"] else 1
+    finally:
+        master.close()
+
+
+def run_modbus_slave_cli(args):
+    """--modbus-slave：Modbus 从站模拟器（手动启动才监听，Ctrl+C 停止）。"""
+    _force_utf8_stdout()
+    import modbus_tools as mt
+    import nettest
+    try:
+        store = mt.DataStore(size=args.size)
+
+        def _log(e):
+            print("[%s] %s 站号 %s 功能码 %s  请求 %s  应答 %s%s" % (
+                e["time"], e["transport"], e["unit"], e["func"],
+                e["req_hex"], e["resp_hex"] or "（无）",
+                ("  " + e["note"]) if e["note"] else ""), flush=True)
+        if args.rtu:
+            slave = mt.RtuSlave(store, args.rtu, baud=args.baud or 9600, parity=args.parity,
+                                stopbits=args.stopbits, unit=args.slave, log=_log)
+        else:
+            slave = mt.TcpSlave(store, host=args.host, port=args.tcp_port,
+                                unit=args.slave, log=_log)
+        slave.start()
+    except nettest.TestError as e:
+        print("[ 失败 ] " + str(e))
+        return 1
+    print("Modbus Slave 从站模拟器已启动：监听 %s，每区 %d 个数据。Ctrl+C 停止。"
+          % (slave.address, args.size), flush=True)
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("正在停止…")
+    finally:
+        slave.stop()
+    return 0
 
 
 def run_nettest_cli(argv):
@@ -2803,11 +2908,35 @@ def main(argv=None):
                     help="485 诊断时扫描站号 1-247（慢，有超时上限）")
     ap.add_argument("--register", type=int, default=0, help="485 诊断的起始寄存器地址（默认 0）")
     ap.add_argument("--count", type=int, default=4, help="485 诊断读的寄存器个数（默认 4）")
-    ap.add_argument("--function", type=int, default=3, choices=(3, 4),
-                    help="485 诊断功能码：3 保持寄存器 / 4 输入寄存器（只读）")
+    ap.add_argument("--function", type=int, default=3, choices=(1, 2, 3, 4, 5, 6, 15, 16),
+                    help="功能码：485 诊断只用 3/4（只读）；Modbus Poll 可用 01/02/03/04/05/06/15/16")
     ap.add_argument("--baud", type=int, default=None, help="485 诊断指定波特率（不指定则自动试常用波特率）")
     ap.add_argument("--timeout-ms", type=int, default=300, help="485 诊断单次应答超时毫秒（默认 300）")
     ap.add_argument("--list-serial", action="store_true", help="列出本机串口")
+    ap.add_argument("--modbus-poll", action="store_true",
+                    help="Modbus 主站测试（Poll）：配合 --tcp 或 --rtu、--slave、--function、--address、--count；"
+                         "写功能配合 --values，例如：--modbus-poll --tcp 192.168.1.10:502 --function 3 --address 0 --count 10")
+    ap.add_argument("--modbus-slave", action="store_true",
+                    help="Modbus 从站模拟器（Slave）：配合 --tcp-port 或 --rtu、--slave，Ctrl+C 停止")
+    ap.add_argument("--tcp", metavar="主机:端口", default=None,
+                    help="Modbus Poll 的 TCP 目标，例如 192.168.1.10:502（端口可省略，默认 502）")
+    ap.add_argument("--rtu", metavar="串口", default=None,
+                    help="Modbus Poll/Slave 的串口，例如 COM3")
+    ap.add_argument("--tcp-port", type=int, default=502, help="Modbus Slave 的 TCP 监听端口（默认 502）")
+    ap.add_argument("--host", default="0.0.0.0", help="Modbus Slave 的监听地址（默认 0.0.0.0）")
+    ap.add_argument("--address", type=int, default=0, help="Modbus Poll 的起始地址（默认 0）")
+    ap.add_argument("--poll-seconds", type=float, default=0,
+                    help="Modbus Poll 连续轮询间隔秒（0=只测一次，>0 时一直轮询到 Ctrl+C）")
+    ap.add_argument("--values", default=None,
+                    help="Modbus Poll 写功能的值（逗号分隔；寄存器按 --data-type/--byte-order 解释）")
+    ap.add_argument("--data-type", default="uint16",
+                    choices=("int16", "uint16", "int32", "uint32", "float32", "float64"),
+                    help="寄存器数据类型（默认 uint16）")
+    ap.add_argument("--byte-order", default="ABCD", choices=("ABCD", "CDAB", "BADC", "DCBA"),
+                    help="字节序（默认 ABCD）")
+    ap.add_argument("--parity", default="N", choices=("N", "E", "O"), help="RTU 校验位（默认 N）")
+    ap.add_argument("--stopbits", type=float, default=1, choices=(1, 1.5, 2), help="RTU 停止位（默认 1）")
+    ap.add_argument("--size", type=int, default=10000, help="Modbus Slave 每区数据个数（默认 10000）")
     ap.add_argument("--admin", action="store_true", help="安全管理菜单（体检/一键加固/账号管理）")
     ap.add_argument("--harden", action="store_true", help="一键加固：开启加密、关闭匿名、创建登录账号")
     ap.add_argument("--add-user", metavar="用户名", help="添加账号或重设密码（会提示输入密码）")
@@ -2826,6 +2955,10 @@ def main(argv=None):
         return run_stability_cli(args.stability)
     if args.stability_multi:
         return run_stability_multi_cli(args.stability_multi)
+    if args.modbus_poll:
+        return run_modbus_poll_cli(args)
+    if args.modbus_slave:
+        return run_modbus_slave_cli(args)
 
     base_dir = program_dir()
     cfg_path = args.config or os.path.join(base_dir, "config.json")

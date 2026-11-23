@@ -132,6 +132,54 @@ class LogicSave(unittest.TestCase):
         self.assertEqual(self.logic.probes()["probes"], [])
 
 
+class ModbusParams(unittest.TestCase):
+    """v2.8：Modbus Poll/Slave 表单参数拼装（纯函数）。"""
+
+    def test_poll_tcp_params(self):
+        p = du.build_modbus_poll_params({"transport": "TCP", "host": "192.168.1.20", "port": "502",
+                                         "unit": "7", "func": "03 读保持寄存器", "addr": "100",
+                                         "count": "4", "dtype": "float32", "order": "CDAB",
+                                         "interval": "0.5"})
+        self.assertEqual(p["transport"], "tcp")
+        self.assertEqual(p["func"], 3)
+        self.assertEqual(p["unit"], 7)
+        self.assertEqual(p["addr"], 100)
+        self.assertEqual(p["dtype"], "float32")
+        self.assertEqual(p["order"], "CDAB")
+        self.assertEqual(p["interval"], 0.5)
+
+    def test_poll_rtu_params(self):
+        p = du.build_modbus_poll_params({"transport": "RTU", "serial": "COM5", "baud": "19200",
+                                         "parity": "E", "stopbits": "2", "func": "16 写多寄存器",
+                                         "values": "123.45"})
+        self.assertEqual(p["transport"], "rtu")
+        self.assertEqual(p["func"], 16)
+        self.assertEqual(p["baud"], 19200)
+        self.assertEqual(p["parity"], "E")
+        self.assertEqual(p["stopbits"], 2.0)
+
+    def test_poll_bad_values_rejected(self):
+        with self.assertRaises(ValueError):
+            du.build_modbus_poll_params({"transport": "TCP", "host": "", "func": "03 读保持寄存器"})
+        with self.assertRaises(ValueError):
+            du.build_modbus_poll_params({"transport": "TCP", "host": "1.2.3.4", "unit": "999",
+                                         "func": "03 读保持寄存器"})
+        with self.assertRaises(ValueError):
+            du.build_modbus_poll_params({"transport": "RTU", "serial": "", "func": "03 读保持寄存器"})
+
+    def test_slave_params(self):
+        p = du.build_modbus_slave_params({"transport": "TCP", "host": "0.0.0.0", "tcp_port": "1502",
+                                          "unit": "3", "size": "5000"})
+        self.assertEqual(p["tcp_port"], 1502)
+        self.assertEqual(p["size"], 5000)
+        p = du.build_modbus_slave_params({"transport": "RTU", "serial": "COM3", "unit": "7"})
+        self.assertEqual(p["unit"], 7)
+        with self.assertRaises(ValueError):
+            du.build_modbus_slave_params({"transport": "RTU", "serial": "COM3", "unit": "0"})
+        with self.assertRaises(ValueError):
+            du.build_modbus_slave_params({"transport": "TCP", "size": "70000"})
+
+
 class EntryPoints(unittest.TestCase):
     def test_help_lists_desktop_and_settings(self):
         buf = io.StringIO()
@@ -142,11 +190,19 @@ class EntryPoints(unittest.TestCase):
         self.assertIn("--desktop", text)
         self.assertIn("--settings", text)
 
-    def test_version_is_26(self):
+    def test_version_is_28(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
             sa.main(["--version"])
-        self.assertIn("2.6", buf.getvalue())
+        self.assertIn("2.8", buf.getvalue())
+
+    def test_help_lists_modbus_tools(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
+            sa.main(["--help"])
+        text = buf.getvalue()
+        self.assertIn("--modbus-poll", text)
+        self.assertIn("--modbus-slave", text)
 
 
 class WindowSmoke(unittest.TestCase):
@@ -167,6 +223,9 @@ class WindowSmoke(unittest.TestCase):
             win.root.update()
             tabs = [win.nb.tab(i, "text") for i in range(win.nb.index("end"))]
             self.assertEqual(tabs, ["运行状态", "告警与通知", "诊断工具", "系统设置"])
+            # v2.8：诊断工具页有 Modbus Poll / Slave 两个区域
+            for attr in ("mbp_out", "mbp_poll_btn", "mbs_log", "mbs_area_out", "mbs_btn"):
+                self.assertTrue(hasattr(win, attr), attr)
             win._on_close()
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
