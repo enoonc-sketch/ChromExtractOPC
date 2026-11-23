@@ -2106,19 +2106,18 @@ def start_web_settings(cfg, open_browser=False):
 
 
 def run_settings_only(cfg):
-    """只打开设置页面（不启动 OPC UA 服务），按 Ctrl+C 或关闭窗口结束。"""
-    cfg = dict(cfg, web_ui=True)
-    ws = start_web_settings(cfg, open_browser=True)
-    if ws is None:
-        return 3
-    print("设置页面已打开：%s\n（浏览器没自动打开就手动复制这个地址；改完关闭本窗口即可）" % ws.url())
+    """只打开桌面设置窗口（不启动 OPC UA 服务），关闭窗口结束。"""
+    import desktop_ui
+    note = ""
     try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
+        import bgrun
+        running, _st, _msg = bgrun.read_status(cfg.get("_base_dir") or program_dir())
+        if running:
+            note = ("后台服务正在运行：本窗口只改设置，通道实时状态请看图形窗口"
+                    "（网页 http://127.0.0.1:%s/ 仍可用）" % cfg.get("web_port", 8840))
+    except Exception:  # noqa
         pass
-    ws.stop()
-    return 0
+    return desktop_ui.run_desktop(cfg, start_service=False, background_note=note)
 
 
 def _resource(rel):
@@ -2136,186 +2135,12 @@ def _set_window_icon(win):
 
 
 def run_gui(cfg):
-    import tkinter as tk
-    from tkinter import scrolledtext
+    """打开桌面窗口（服务同时启动）。v2.6 起网页设置界面改为桌面窗口，见 desktop_ui.py。"""
     _hide_own_console()
-
-    root = tk.Tk()
-    root.title("色谱提取 OPC UA 服务 v%s" % __version__)
-    _set_window_icon(root)
-    root.geometry("760x520")
-
-    status = tk.StringVar(value="启动中…")
-    tk.Label(root, textvariable=status, anchor="w", fg="blue",
-             font=("Microsoft YaHei", 11)).pack(fill="x", padx=10, pady=(10, 2))
-    sec_var = tk.StringVar(value=security_summary(cfg))
-    bar = tk.Frame(root)
-    bar.pack(fill="x", padx=10)
-    tk.Label(bar, textvariable=sec_var, anchor="w").pack(side="left")
-    tk.Button(bar, text="安全设置…",
-              command=lambda: SecurityWindow(root, cfg, _TkDialogs(root))).pack(side="right")
-    web = {}
-
-    def open_web():
-        import webbrowser
-        ws = web.get("srv") or start_web_settings(dict(cfg, web_ui=True))
-        if ws is not None:
-            web["srv"] = ws
-            webbrowser.open(ws.url())
-    tk.Button(bar, text="打开设置页面…", command=open_web).pack(side="right", padx=4)
-
-    def _gui_transmission(send):
-        # 后台线程连本机服务做检测/发送，结果写日志窗，不阻塞界面
-        def work():
-            try:
-                ep = _local_endpoint(cfg["endpoint"])
-                base = cfg.get("_base_dir") or program_dir()
-                cd = cfg.get("cert_dir") or "certs"
-                cert_dir = cd if os.path.isabs(cd) else os.path.join(base, cd)
-                get_log().info("开始%s（%s）…", "发送测试数据并检测" if send else "数据传输检测", ep)
-                result = asyncio.run(transmission_check_async(
-                    ep, namespace_uri=cfg.get("namespace_uri") or "urn:chromextract:opcua",
-                    security=cfg.get("security", "none"), cert_dir=cert_dir,
-                    duration_sec=6, do_send_test=bool(send)))
-                for s in result.get("steps", []):
-                    get_log().info("%s %s：%s", "[ 通过 ]" if s["ok"] else "[ 失败 ]",
-                                   s["name"], s["detail"])
-                get_log().info("数据传输检测%s", "通过：数据传输正常" if result.get("ok")
-                               else "未通过，见上面失败步骤")
-            except Exception as e:  # noqa
-                get_log().error("数据传输检测出错：%s", e)
-        threading.Thread(target=work, daemon=True).start()
-
-    def _gui_diagnose():
-        # 后台线程：先跑传输检测，再做五层诊断，结果进日志窗，不阻塞界面
-        def work():
-            try:
-                ep = _local_endpoint(cfg["endpoint"])
-                base = cfg.get("_base_dir") or program_dir()
-                cd = cfg.get("cert_dir") or "certs"
-                cert_dir = cd if os.path.isabs(cd) else os.path.join(base, cd)
-                get_log().info("开始智能诊断（%s）…", ep)
-                tx = asyncio.run(transmission_check_async(
-                    ep, namespace_uri=cfg.get("namespace_uri") or "urn:chromextract:opcua",
-                    security=cfg.get("security", "none"), cert_dir=cert_dir,
-                    duration_sec=6, do_send_test=False))
-                for s in tx.get("steps", []):
-                    get_log().info("%s %s：%s", "[ 通过 ]" if s["ok"] else "[ 失败 ]",
-                                   s["name"], s["detail"])
-                result = diagnose(cfg, transmission_result=tx)
-                icons = {"ok": "[ 通过 ]", "warn": "[ 注意 ]", "fail": "[ 失败 ]"}
-                for f in result.get("findings", []):
-                    get_log().info("%s %s：%s", icons.get(f["level"], "[ ? ]"),
-                                   f["name"], f["evidence"])
-                    if f["level"] != "ok":
-                        get_log().info("处理：%s", f["advice"])
-                get_log().info("智能诊断结论：%s", result.get("overall", ""))
-                for i, a in enumerate(result.get("actions", []), 1):
-                    get_log().info("处理清单 %d. %s", i, a)
-            except Exception as e:  # noqa
-                get_log().error("智能诊断出错：%s", e)
-        threading.Thread(target=work, daemon=True).start()
-
-    tk.Button(bar, text="智能诊断",
-              command=_gui_diagnose).pack(side="right", padx=4)
-    tk.Button(bar, text="发送测试数据",
-              command=lambda: _gui_transmission(True)).pack(side="right", padx=4)
-    tk.Button(bar, text="数据传输检测",
-              command=lambda: _gui_transmission(False)).pack(side="right", padx=4)
-
-    def _gui_rtu485():
-        # 后台线程做 485 配型诊断（只读），结果进日志窗
-        from tkinter import simpledialog
-        port = simpledialog.askstring("485配型诊断", "串口（例如 COM3）：", parent=root)
-        if not port:
-            return
-        def work():
-            try:
-                import nettest
-                get_log().info("开始 485 配型诊断（%s，自动试参数，只读）…", port)
-                r = nettest.diagnose_rtu485(
-                    port.strip(), progress=lambda s: get_log().info("%s", s))
-                get_log().info("%s %s", "[ 通过 ]" if r["ok"] else "[ 失败 ]", r["summary"])
-                for line in r["details"]:
-                    for sub in str(line).split("\n"):
-                        get_log().info("%s", sub)
-            except Exception as e:  # noqa
-                get_log().error("485 配型诊断出错：%s", e)
-        threading.Thread(target=work, daemon=True).start()
-
-    tk.Button(bar, text="485配型诊断",
-              command=_gui_rtu485).pack(side="right", padx=4)
-    box = scrolledtext.ScrolledText(root, state="disabled")
-    box.pack(fill="both", expand=True, padx=10, pady=6)
-
-    def pump_log():
-        try:
-            while True:
-                rec = log_q.get_nowait()
-                box.configure(state="normal")
-                box.insert("end", rec + "\n")
-                box.see("end")
-                box.configure(state="disabled")
-        except queue.Empty:
-            pass
-        root.after(300, pump_log)
-
-    def refresh_sec():
-        text = security_summary(cfg)       # 配置热加载后摘要随之更新
-        mon = ALERTS.get("monitor")
-        if mon is not None:
-            snap = mon.snapshot()
-            text = ("告警：%d 项（%s）    " % (len(snap["active"]), snap["worst"]) if snap["active"]
-                    else "告警：无    ") + ("[推送静默至 %s]    " % snap["quiet"]["until"] if snap.get("quiet") else "") + text
-        sec_var.set(text)
-        root.after(5000, refresh_sec)
-
-    class QHandler(logging.Handler):
-        def emit(self, record):
-            log_q.put(self.format(record))
-
-    setup_logging(cfg, cfg["_base_dir"])
-    logging.getLogger().addHandler(QHandler())
-
-    holder = {}   # loop / stop 事件都在服务线程的事件循环里创建，关闭时线程安全地置位
-    worker_done = threading.Event()
-
-    def server_worker():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-        async def _main():
-            holder["loop"] = loop
-            holder["stop"] = asyncio.Event()
-            await run_server(cfg, holder["stop"])
-
-        try:
-            loop.run_until_complete(_main())
-        except Exception as e:  # noqa
-            status.set("服务出错：" + str(e))
-            get_log().error("服务线程退出：%s", e)
-        finally:
-            worker_done.set()
-
-    threading.Thread(target=server_worker, daemon=True).start()
-    web["srv"] = start_web_settings(cfg)
-    status.set("运行中：%s" % cfg["endpoint"])
-    pump_log()
-    refresh_sec()
-    root.protocol("WM_DELETE_WINDOW", root.destroy)
-    root.mainloop()
-    lp, ev = holder.get("loop"), holder.get("stop")
-    if lp is not None and ev is not None:
-        try:
-            lp.call_soon_threadsafe(ev.set)
-        except RuntimeError:
-            pass
-    worker_done.wait(timeout=5)
+    import desktop_ui
+    return desktop_ui.run_desktop(cfg, start_service=True)
 
 
-# ---------------------------------------------------------------------------
-# Windows 控制台辅助：双击 EXE 时别让错误一闪而过
-# ---------------------------------------------------------------------------
 
 def _own_console():
     """Windows 上，这个控制台窗口是不是只属于本程序（即双击 EXE 启动，而不是在 cmd 里运行）。
@@ -2929,7 +2754,8 @@ def main(argv=None):
     ap.add_argument("--selftest", action="store_true",
                     help="自检：造演示数据、启动服务、用客户端读一遍（不影响现有配置）")
     ap.add_argument("--config", default=None, help="配置文件（默认：程序目录 config.json）")
-    ap.add_argument("--gui", action="store_true", help="打开图形监控窗口")
+    ap.add_argument("--gui", action="store_true", help="打开桌面窗口（服务同时启动）")
+    ap.add_argument("--desktop", action="store_true", help="同 --gui：打开桌面窗口")
     ap.add_argument("--background", action="store_true",
                     help="后台静默运行：不显示任何窗口，日志只写 logs\\server.log；同一台电脑只运行一个实例")
     ap.add_argument("--status", action="store_true", help="查看后台服务是否在运行")
@@ -2941,7 +2767,7 @@ def main(argv=None):
     ap.add_argument("--service-status", action="store_true", help="查看 Windows 服务状态")
     ap.add_argument("--service", action="store_true", help=argparse.SUPPRESS)   # 仅供 Windows 服务管理器调用
     ap.add_argument("--stop", action="store_true", help="让后台服务正常停止（20 秒没停才强制结束）")
-    ap.add_argument("--settings", action="store_true", help="只打开浏览器设置页面（不启动服务）")
+    ap.add_argument("--settings", action="store_true", help="只打开桌面设置窗口（不启动服务）")
     ap.add_argument("--stability", nargs="+", metavar="参数",
                     help="长时间稳定性测试，参数同 --nettest，另加 interval=秒 minutes=分钟，例如："
                          "--stability modbus_rtu port=COM3 baud=9600 unit=1 interval=1 minutes=60")
@@ -3134,7 +2960,7 @@ def main(argv=None):
     # Windows 服务管理器启动：交给服务宿主，内部按后台模式运行
     if args.service:
         return run_windows_service(cfg, base_dir, cfg_path)
-    return serve(cfg, base_dir, cfg_path, mode="background" if args.background else ("gui" if args.gui else "console"))
+    return serve(cfg, base_dir, cfg_path, mode="background" if args.background else ("gui" if (args.gui or args.desktop) else "console"))
 
 
 def service_cli(args):
@@ -3192,12 +3018,8 @@ def serve(cfg, base_dir, cfg_path, mode="console", ctl=None):
         _, st, _ = bgrun.read_status(base_dir)
         url = (st or {}).get("web") or "http://127.0.0.1:%s/" % cfg.get("web_port", 8840)
         if mode == "gui":
-            # 后台服务已在运行：窗口模式不再另起一个服务，直接打开设置页面
-            import webbrowser
-            try:
-                webbrowser.open(url)
-            except Exception:  # noqa
-                pass
+            # 后台服务已在运行：窗口模式不再另起一个服务，直接打开桌面设置窗口
+            return run_settings_only(cfg)
         elif mode == "console":
             print("服务已经在运行（后台）。设置页面：%s" % url)
         # Windows 服务：另一个实例（如手动后台启动的）占着，服务这次启动失败，由 SCM 记录

@@ -48,7 +48,7 @@ Name: "autostart"; Description: "开机自动在后台运行服务"; GroupDescri
 Name: "autostart\service"; Description: "注册为 Windows 服务（推荐：services.msc 里可启停，崩溃自动重启）"; GroupDescription: "运行方式："; Flags: exclusive
 Name: "autostart\task"; Description: "使用计划任务（兼容旧版本）"; GroupDescription: "运行方式："; Flags: exclusive unchecked
 Name: "desktopicon"; Description: "创建桌面快捷方式（图形监控窗口）"; GroupDescription: "快捷方式："
-Name: "desktopsettings"; Description: "创建桌面快捷方式（设置页面）"; GroupDescription: "快捷方式："
+Name: "desktopsettings"; Description: "创建桌面快捷方式（桌面设置窗口）"; GroupDescription: "快捷方式："
 
 [Dirs]
 ; 允许本机普通用户修改配置/日志（与原 安装.bat 的 icacls 一致）
@@ -90,8 +90,8 @@ Name: "{autodesktop}\色谱提取 OPC UA"; Filename: "{app}\{#MyAppExe}"; Parame
 Name: "{autodesktop}\色谱提取 OPC UA 设置"; Filename: "{app}\打开设置页面.bat"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExe}"; Tasks: desktopsettings
 
 [Run]
-Filename: "http://127.0.0.1:8840/"; Description: "打开设置页面"; Flags: postinstall shellexec nowait skipifsilent; Tasks: autostart
-Filename: "{app}\{#MyAppExe}"; Parameters: "--gui"; WorkingDir: "{app}"; Description: "启动图形监控窗口"; Flags: postinstall nowait skipifsilent unchecked; Tasks: not autostart
+Filename: "{app}\{#MyAppExe}"; Parameters: "--settings"; WorkingDir: "{app}"; Description: "打开桌面设置窗口"; Flags: postinstall nowait skipifsilent; Tasks: autostart
+Filename: "{app}\{#MyAppExe}"; Parameters: "--gui"; WorkingDir: "{app}"; Description: "打开桌面窗口（服务同时启动）"; Flags: postinstall nowait skipifsilent unchecked; Tasks: not autostart
 
 [Code]
 const
@@ -161,7 +161,7 @@ begin
   DataPage := CreateInputQueryPage(wpSelectTasks, '色谱数据所在文件夹',
     '存放 *_V3.db 或 .mbd 文件的文件夹',
     '服务会监控这个文件夹里的谱图数据并通过 OPC UA 发布。' + #13#10 +
-    '留空 = 稍后在设置页面里再选。升级安装时留空会保留原来的设置。');
+    '留空 = 稍后在桌面设置窗口里再选。升级安装时留空会保留原来的设置。');
   DataPage.Add('数据文件夹：', False);
   DataPage.Values[0] := '';
 
@@ -227,7 +227,7 @@ begin
   begin
     WizardForm.StatusLabel.Caption := '设置数据文件夹...';
     if RunHidden(Exe, '--no-pause --set-watch-dir ' + Q(Dir)) <> 0 then
-      MsgBox('数据文件夹没设置成功，请稍后在设置页面里修改。', mbInformation, MB_OK);
+      MsgBox('数据文件夹没设置成功，请稍后在桌面设置窗口里修改。', mbInformation, MB_OK);
   end;
 
   Fw := Trim(FwPage.Values[0]);
@@ -260,7 +260,7 @@ begin
         Q(ExpandConstant('{app}\install_autostart.ps1')) + ' -Exe ' + Q(Exe) + ' -System') = 0 then
     begin
       RunHidden(ExpandConstant('{sys}\schtasks.exe'), '/Run /TN ' + TaskName);
-      Sleep(3000);   { 给设置页面一点启动时间，完成页上的"打开设置页面"才能打开 }
+      Sleep(3000);   { 给后台服务一点启动时间，完成页上的"打开桌面设置窗口"才能打开 }
     end
     else
       MsgBox('开机自启没设置成功，请稍后以管理员身份运行 安装开机自启.bat。', mbInformation, MB_OK);

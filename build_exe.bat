@@ -48,6 +48,7 @@ build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --console 
   --hidden-import tkinter ^
   --hidden-import demo_data ^
   --hidden-import web_settings ^
+  --hidden-import desktop_ui ^
   --hidden-import config_tools ^
   --hidden-import alerts ^
   --hidden-import nettest ^
