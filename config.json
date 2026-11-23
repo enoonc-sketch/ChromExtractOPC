@@ -43,5 +43,8 @@
   "alert_channel_rules": [],
   "alert_probes": [],
   "env_check_on_start": true,
-  "env_check_hours": 6
+  "env_check_hours": 6,
+  "allow_test_send": true,
+  "test_send_min_interval_sec": 5,
+  "transmission_stale_sec": 7200
 }

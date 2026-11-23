@@ -622,6 +622,263 @@ def test_modbus_rtu(port, baud=9600, bytesize=8, parity="N", stopbits=1, unit=1,
             pass
 
 
+
+
+# ---------------------------------------------------------------------------
+# RS-485 数据配型自诊断（v2.5 新增）：自动试串口参数 + 数据类型/字节序配型
+# 只发读功能码 03/04，绝不写寄存器。串口打开走 _open_serial（可注入 factory 做测试）。
+# ---------------------------------------------------------------------------
+
+RTU_BAUDS = (9600, 19200, 38400, 115200, 4800, 2400, 57600)
+RTU_PARITIES = ("N", "E", "O")
+RTU_STOPBITS = (1, 2)
+BYTE_ORDERS = ("ABCD", "CDAB", "BADC", "DCBA")
+
+
+def _order_bytes(b4, order):
+    """4 字节按字节序重排：ABCD 原样 / CDAB 字交换 / BADC 字内字节交换 / DCBA 全反。"""
+    a, b, c, d = b4
+    return {"ABCD": bytes([a, b, c, d]), "CDAB": bytes([c, d, a, b]),
+            "BADC": bytes([b, a, d, c]), "DCBA": bytes([d, c, b, a])}[order]
+
+
+def _order_bytes8(b8, order):
+    a, b, c, d, e, f, g, h = b8
+    return {"ABCD": bytes([a, b, c, d, e, f, g, h]),
+            "CDAB": bytes([g, h, e, f, c, d, a, b]),
+            "BADC": bytes([b, a, d, c, f, e, h, g]),
+            "DCBA": bytes([h, g, f, e, d, c, b, a])}[order]
+
+
+def decode_candidates(regs):
+    """把寄存器（uint16 列表）按全部类型×字节序解码，返回候选列表（未打分）。
+    16 位类型逐个寄存器解（大端/小端各一份）；32 位类型逐对解；64 位需 4 个寄存器。"""
+    out = []
+    for i, r in enumerate(regs):
+        for endian, order in (("big", "AB"), ("little", "BA")):
+            raw = r.to_bytes(2, endian)
+            out.append({"dtype": "uint16", "order": order, "index": i,
+                        "value": int.from_bytes(raw, "big") if endian == "little" else r})
+            v = int.from_bytes(raw, "big", signed=True) if endian == "little" else (
+                r - 65536 if r >= 32768 else r)
+            out.append({"dtype": "int16", "order": order, "index": i, "value": v})
+    for i in range(0, len(regs) - 1, 2):
+        b4 = struct.pack(">HH", regs[i], regs[i + 1])
+        for order in BYTE_ORDERS:
+            raw = _order_bytes(b4, order)
+            out.append({"dtype": "uint32", "order": order, "index": i,
+                        "value": int.from_bytes(raw, "big")})
+            out.append({"dtype": "int32", "order": order, "index": i,
+                        "value": int.from_bytes(raw, "big", signed=True)})
+            out.append({"dtype": "float32", "order": order, "index": i,
+                        "value": struct.unpack(">f", raw)[0]})
+    for i in range(0, len(regs) - 3, 4):
+        b8 = struct.pack(">HHHH", *regs[i:i + 4])
+        for order in BYTE_ORDERS:
+            raw = _order_bytes8(b8, order)
+            out.append({"dtype": "float64", "order": order, "index": i,
+                        "value": struct.unpack(">d", raw)[0]})
+    return out
+
+
+def _score_value(v, dtype):
+    """合理性打分 0~100：有限值、量级像过程量（温度/压力/流量等）、不是极端值。"""
+    import math as _math
+    if isinstance(v, float):
+        if _math.isnan(v) or _math.isinf(v):
+            return 0.0, "不是有限数（NaN/Inf），配型肯定不对"
+        if v == 0.0:
+            return 55.0, "值为 0（可能是真零，也可能配错了字节序）"
+        av = abs(v)
+        if 1e-4 <= av <= 1e7:
+            s = 90.0
+            note = "量级像正常过程量"
+        elif av < 1e-4:
+            s, note = 25.0, "数值极小，多半字节序不对"
+        else:
+            s, note = 20.0, "数值极大，多半字节序不对"
+        # 小数位过于杂乱（像随机位模式）扣分；小数位干净（像设定值/测量值）加分
+        if av >= 1e-4 and abs(v - round(v, 6)) > 0 and len(repr(v)) > 14:
+            s -= 10.0
+            note += "；小数位杂乱，像随机位模式"
+        elif av >= 1e-4 and (round(v, 4) == v or len(repr(v)) <= 10):
+            s += 8.0
+            note += "；小数位干净，像真实测量值"
+        return s, note
+    # 整数
+    if v == 0:
+        return 55.0, "值为 0（可能是真零，也可能配错了字节序）"
+    av = abs(v)
+    limit = 2 ** 31 if dtype == "int32" else 2 ** 32
+    if dtype in ("int16", "uint16"):
+        limit = 32768 if dtype == "int16" else 65536
+    if av >= limit - 1:
+        return 15.0, "接近类型上限，像溢出/配错"
+    if dtype in ("int32", "uint32") and av >= 10000 and av % 100 == 0:
+        return 88.0, "整百/整千的整数，像带缩放系数的过程量（如 100000 = 100.000）"
+    if av <= 100000:
+        return 80.0, "量级像正常过程量（注意是否有缩放系数）"
+    return 45.0, "数值偏大，检查字节序与缩放系数"
+
+
+def match_data_types(regs1, regs2=None):
+    """数据配型：对两次读到的寄存器逐候选打分（第二次读用于稳定性加分），
+    返回按分数排序的候选 + 推荐配型 + 可粘贴配置片段。"""
+    cands = decode_candidates(regs1)
+    second = {}
+    if regs2 is not None:
+        for c in decode_candidates(regs2):
+            second[(c["dtype"], c["order"], c["index"])] = c["value"]
+    for c in cands:
+        s, note = _score_value(c["value"], c["dtype"])
+        v2 = second.get((c["dtype"], c["order"], c["index"]))
+        if v2 is not None:
+            if v2 == c["value"]:
+                s += 8.0
+                note += "；两次读数一致，稳定"
+            elif isinstance(c["value"], float) and c["value"] and abs(v2 - c["value"]) <= abs(c["value"]) * 0.05:
+                s += 6.0
+                note += "；两次读数接近，变化平滑"
+            elif isinstance(c["value"], (int, float)) and isinstance(v2, (int, float)) and \
+                    abs(v2 - c["value"]) > max(1.0, abs(c["value"]) * 0.5):
+                s -= 15.0
+                note += "；两次读数跳变大，不像同一物理量"
+        c["score"] = round(max(0.0, min(100.0, s)), 1)
+        c["note"] = note
+    # 同一对寄存器若浮点解得通顺，16 位碎片与整数解释多半是假象，降权
+    good_float = {(c["index"]) for c in cands
+                  if c["dtype"] in ("float32", "float64") and c["score"] >= 85}
+    for c in cands:
+        if c["dtype"] in ("int16", "uint16") and (c["index"] in good_float or c["index"] - 1 in good_float):
+            c["score"] = round(max(0.0, c["score"] - 30.0), 1)
+            c["note"] += "；同一对寄存器浮点解得通顺，这多半是浮点的高/低字碎片"
+        elif c["dtype"] in ("int32", "uint32") and c["index"] in good_float:
+            c["score"] = round(max(0.0, c["score"] - 20.0), 1)
+            c["note"] += "；同一对寄存器浮点解得通顺，整数解释多半是假象"
+    # 32 位整数解得通顺时，其高/低 16 位碎片降权
+    good_int = {c["index"] for c in cands
+                if c["dtype"] in ("int32", "uint32") and c["score"] >= 85}
+    for c in cands:
+        if c["dtype"] in ("int16", "uint16") and (c["index"] in good_int or c["index"] - 1 in good_int):
+            c["score"] = round(max(0.0, c["score"] - 20.0), 1)
+            c["note"] += "；同一对寄存器 32 位整数解得通顺，这多半是它的高/低字碎片"
+    cands.sort(key=lambda c: -c["score"])
+    best = cands[0] if cands else None
+    snippet = ""
+    if best:
+        snippet = ("# 推荐配型（寄存器地址偏移 %d 起）\n"
+                   "data_type = \"%s\"\nbyte_order = \"%s\"\n"
+                   "# 若数值差 10/100/1000 倍，再加 scale 缩放系数" % (
+                       best["index"], best["dtype"], best["order"]))
+    return {"candidates": cands, "best": best, "config_snippet": snippet}
+
+
+def _rtu_read_once(port, baud, parity, stopbits, unit, func, addr, count, timeout, factory=None):
+    """按一组参数发一次读请求，成功返回寄存器列表，失败抛 TestError。只读（03/04）。"""
+    if int(func) not in (3, 4):
+        raise TestError("485 配型诊断只允许读功能码 03/04")
+    req = build_rtu_request(unit, func, addr, count)
+    s = _open_serial(port, baud, 8, parity, stopbits, timeout, False, factory)
+    try:
+        try:
+            s.reset_input_buffer()
+        except Exception:  # noqa
+            pass
+        _write(s, req)
+        want = expected_rtu_len(int(func), int(count))
+        resp = _read_until(s, timeout, want=want)
+        if resp.startswith(req):
+            resp = resp[len(req):]
+            if len(resp) < want:
+                resp += _read_until(s, timeout, want=want - len(resp))
+        if not resp:
+            raise TestError("无应答")
+        values, _kind = parse_rtu_response(req, resp)
+        return values
+    finally:
+        try:
+            s.close()
+        except Exception:  # noqa
+            pass
+
+
+def probe_rtu_params(port, unit=1, func=3, addr=0, count=4, bauds=None, timeout=0.3,
+                     factory=None, progress=None, scan_slaves=False, deadline_sec=180):
+    """自动试串口参数：波特率×校验×停止位（×站号扫描）。命中返回 (参数dict, 寄存器)，
+    全部试完没命中返回 (None, 已试组合数)。progress(文本) 可选进度回调。"""
+    bauds = tuple(bauds) if bauds else RTU_BAUDS
+    units = range(1, 248) if scan_slaves else (int(unit),)
+    tried = 0
+    end = time.monotonic() + max(5, int(deadline_sec))
+    for baud in bauds:
+        for parity in RTU_PARITIES:
+            for stopbits in RTU_STOPBITS:
+                for u in units:
+                    if time.monotonic() > end:
+                        return None, tried
+                    tried += 1
+                    if progress and (tried == 1 or tried % 50 == 0):
+                        progress("已试 %d 组参数（当前 %d,%s,%g 站号 %d）…" % (tried, baud, parity, stopbits, u))
+                    try:
+                        regs = _rtu_read_once(port, baud, parity, stopbits, u, func, addr,
+                                              count, timeout, factory)
+                    except TestError:
+                        continue
+                    return {"baud": baud, "parity": parity, "stopbits": stopbits,
+                            "unit": u, "func": int(func)}, regs
+    return None, tried
+
+
+def diagnose_rtu485(port, unit=1, func=3, addr=0, count=4, baud=None, timeout=0.3,
+                    scan_slaves=False, factory=None, progress=None):
+    """RS-485 数据配型自诊断全流程：试参数 → 连读两次 → 类型/字节序配型排名。
+    返回 _result 风格 dict，另带 params/candidates/best/config_snippet。"""
+    port, _b, _bs, _p, _sb = _serial_args(port, baud or 9600, 8, "N", 1)
+    to = _timeout(timeout, 0.3)
+    lock = port_lock(port)
+    if lock is not None and not lock.acquire(blocking=False):
+        return _result(False, "%s 正在被其它测试占用，请稍后再试" % port, [])
+    try:
+        params, regs_or_tried = probe_rtu_params(
+            port, unit=unit, func=func, addr=addr, count=count,
+            bauds=(int(baud),) if baud else None, timeout=to, factory=factory,
+            progress=progress, scan_slaves=scan_slaves)
+        if params is None:
+            return _result(False, "试了 %d 组参数，%s 上没有 Modbus RTU 设备应答" % (regs_or_tried, port),
+                           ["排查：1) RS-485 A/B 是否接反（交换试试）；2) 总线两端 120Ω 终端电阻；",
+                            "3) 设备站号（可用 --scan-slaves 扫 1-247）；4) 设备是否上电、波特率是否在常用表内；",
+                            "5) USB 转 485 驱动与 COM 口号是否正确（--list-serial 查看）。"])
+        regs1 = regs_or_tried
+        details = ["命中参数：%s %d,8,%s,%g 站号 %d 功能码 %02d 地址 %d 数量 %d" % (
+            port, params["baud"], params["parity"], params["stopbits"], params["unit"],
+            params["func"], int(addr), int(count)),
+            "原始寄存器：" + " ".join("0x%04X" % r for r in regs1)]
+        regs2 = None
+        try:
+            regs2 = _rtu_read_once(port, params["baud"], params["parity"], params["stopbits"],
+                                   params["unit"], params["func"], addr, count, to, factory)
+            details.append("第二次读数：" + " ".join("0x%04X" % r for r in regs2))
+        except TestError as e:
+            details.append("第二次读数失败（%s），只按一次读数配型" % e)
+        m = match_data_types(regs1, regs2)
+        for c in m["candidates"][:8]:
+            details.append("候选 %s/%s（偏移 %d）：%r  分数 %.0f —— %s" % (
+                c["dtype"], c["order"], c["index"], c["value"], c["score"], c["note"]))
+        best = m["best"]
+        summary = "485 配型诊断完成：推荐 %s + 字节序 %s（偏移 %d，值 %r，分数 %.0f）" % (
+            best["dtype"], best["order"], best["index"], best["value"], best["score"]) if best else "无候选"
+        r = _result(True, summary, details + (["配置片段：", m["config_snippet"]] if m["config_snippet"] else []))
+        r.update({"params": params, "candidates": m["candidates"], "best": best,
+                  "config_snippet": m["config_snippet"], "registers": regs1})
+        return r
+    finally:
+        if lock is not None:
+            try:
+                lock.release()
+            except Exception:  # noqa
+                pass
+
+
 # ---------------------------------------------------------------------------
 # 统一入口（网页 / 命令行）
 # ---------------------------------------------------------------------------
@@ -636,6 +893,7 @@ TESTS = {
     "serial_list": (list_serial_ports, ()),
     "serial": (test_serial, ("port", "baud", "bytesize", "parity", "stopbits", "send", "mode", "timeout", "rs485_rts")),
     "loopback": (test_serial_loopback, ("port", "baud", "bytesize", "parity", "stopbits", "timeout")),
+    "rtu485_diag": (diagnose_rtu485, ("port", "unit", "func", "addr", "count", "baud", "timeout")),
     "modbus_rtu": (test_modbus_rtu, ("port", "baud", "bytesize", "parity", "stopbits", "unit", "func", "addr",
                                      "count", "timeout", "rs485_rts")),
 }

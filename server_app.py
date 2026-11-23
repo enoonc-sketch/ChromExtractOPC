@@ -8,6 +8,10 @@
   2. 解析最新谱图（BinTrc），通过 OPC UA Server 发布，供 DCS/SCADA/实时库订阅；
   3. 提供 OPC UA 方法 ExportCSV，可远程触发把最新数据导出为 CSV；
   4. 命令行模式：--extract 直接导出 CSV，--list 查看数据源，--gui 打开监控窗口。
+  5. 数据传输检测与发送（v2.5）：Diagnostics 诊断节点（只读）+ SendTestData/EchoTest
+     方法 + --check-transmission 客户端检测，证明数据真的在传（不止端口通）。
+  6. 智能诊断（v2.5）：--diagnose / GUI「智能诊断」一键收齐配置—服务—数据—传输—日志
+     五层证据，逐项给通过/注意/失败与具体处理步骤（纯规则，离线可用，不用大模型）。
 
 用法：
   server_app.py                      # 按同目录 config.json 启动 OPC UA 服务
@@ -18,6 +22,11 @@
 
 OPC UA 地址空间（ns=<namespace index>，启动日志会打印实际值）：
   Objects/Chromatograph
+    ├─ Diagnostics/  TestSignal, TestCounter, ChannelCount, GoodChannelCount,
+    │                TotalPoints, LastDataChangeTime, DataAgeSeconds,
+    │                TransmissionStatus, ServerStartTime, UptimeSeconds,
+    │                DiagnosisLevel, DiagnosisSummary, LastDiagnosisTime（只读）
+    ├─ SendTestData() / EchoTest(text)  方法（发送测试数据 / 双向回显，不开写权限）
     └─ Station_<仪器序列号>
          ├─ Info/  SerialNumber, Name, SoftwareVersion, SourceFile
          └─ App<应用>_Stream<流路>_Det<检测器>
@@ -33,6 +42,7 @@ import getpass
 import json
 import logging
 import logging.handlers
+import math
 import os
 import queue
 import sys
@@ -110,6 +120,10 @@ DEFAULT_CONFIG = {
     "alert_probes": [],               # 设备检测：定时 Ping / 端口 / Modbus 等，失败走告警；在设置页面里添加
     "env_check_on_start": True,       # 服务启动后自动做驱动与软件环境检测，"问题"级别的项告警
     "env_check_hours": 6,             # 之后每几小时复查一次；0 = 只在启动时检查
+    # ---- 数据传输检测与发送（v2.4 新增）----
+    "allow_test_send": True,          # 是否允许客户端远程调用 SendTestData（仅写 Station_TEST 测试通道）
+    "test_send_min_interval_sec": 5,  # 远程发送测试数据的最短间隔，防止被反复调用
+    "transmission_stale_sec": 7200,   # 数据超过多少秒没更新视为"数据较旧"（Diagnostics.TransmissionStatus）
 }
 
 
@@ -248,7 +262,8 @@ HOT_KEYS = ("users", "allow_anonymous", "remote_export", "export_min_interval_se
             "alert_stale_minutes", "alert_scan_errors", "alert_webhook",
             "alert_email_to", "smtp_host", "smtp_port", "smtp_security", "smtp_user",
             "smtp_password", "smtp_from", "alert_webhook_level", "alert_email_level", "alert_quiet",
-            "alert_channel_rules", "alert_probes", "env_check_hours")
+            "alert_channel_rules", "alert_probes", "env_check_hours",
+            "allow_test_send", "test_send_min_interval_sec", "transmission_stale_sec")
 RESTART_KEYS = ("env_check_on_start", "endpoint", "security", "allow_insecure_fallback", "cert_dir",
                 "trusted_client_certs_dir", "max_connections", "namespace_uri", "server_name")
 
@@ -502,6 +517,103 @@ async def make_cert(cfg, base_dir):
     return True
 
 
+def _transmission_status(channel_count, good_count, data_age_sec, stale_sec):
+    """Diagnostics.TransmissionStatus 判定（纯函数，便于单测）。
+
+    无通道 -> "无数据"；有通道且有 Good 通道且数据年龄不超阈值 -> "正常"；
+    其余（有通道但全不可信，或数据太旧，或从未有过数据时间）-> "数据较旧"。
+    """
+    try:
+        n = int(channel_count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    try:
+        g = int(good_count or 0)
+    except (TypeError, ValueError):
+        g = 0
+    if n <= 0:
+        return "无数据"
+    try:
+        age = float(data_age_sec)
+        stale = float(stale_sec)
+    except (TypeError, ValueError):
+        return "数据较旧"
+    if g > 0 and age <= stale:
+        return "正常"
+    return "数据较旧"
+
+
+def make_test_record(cycle_id=1, num_points=600, now=None):
+    """生成一条合成谱图记录，字段与 _read_source/_upsert 期望完全一致。
+
+    只用于 SendTestData：写入独立的 Station_TEST 测试通道，绝不冒充真实仪器数据
+    （analyzer/source/det_name 都带 TEST 标记，客户端一眼能分清）。
+    曲线为正弦基线 + 三个高斯峰，与演示数据同风格，约 600 点。
+    """
+    n = max(10, int(num_points or 600))
+    sp = 0.25
+    t = [i * sp for i in range(n)]
+    raw = []
+    for v in t:
+        x = 1000.0 + 300.0 * math.sin(v / 3.0)
+        for c, a, w in ((30.0, 8000.0, 0.6), (75.0, 12000.0, 0.8), (120.0, 5000.0, 0.5)):
+            x += a * math.exp(-((v - c) ** 2) / (2 * w * w))
+        raw.append(float(x))
+    uv = [float(v) for v in raw]
+    val = [float(v) for v in uv]
+    when = now or datetime.now()
+    return dict(
+        source="TEST-SEND", analyzer="TEST", app=0, app_name="测试应用",
+        stream=0, stream_name="测试流路", det=0, det_name="TEST",
+        cycle_id=int(cycle_id or 1), cycle_time=when.strftime("%Y-%m-%d %H:%M:%S"),
+        is_validation=False, cal_level=0, num_points=n, sample_period=sp,
+        duration=t[-1] if t else 0.0, min_raw=min(raw), max_raw=max(raw),
+        y_title="uV", x_title="s", time=[float(v) for v in t],
+        raw=raw, uv=uv, value=val,
+    )
+
+
+def _local_endpoint(endpoint):
+    """把服务端监听地址换成本机客户端能连的地址（0.0.0.0 -> 127.0.0.1）。"""
+    ep = str(endpoint or "").strip()
+    return ep.replace("0.0.0.0", "127.0.0.1")
+
+
+def _light_diagnosis(channel_count, good_count, data_age_sec, stale_sec):
+    """服务端轻量诊断摘要（纯函数）：只用服务端已有计数，不连客户端、不扫文件。
+
+    返回 (level, summary)，level 为 正常/注意/异常，与完整诊断 diagnose() 的 overall 同口径。
+    完整五层诊断（配置/目录/日志/传输）只在 CLI/GUI/工具里跑，beat 里只刷新这个摘要。
+    """
+    try:
+        n = int(channel_count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    try:
+        g = int(good_count or 0)
+    except (TypeError, ValueError):
+        g = 0
+    try:
+        age = float(data_age_sec or 0)
+    except (TypeError, ValueError):
+        age = 0.0
+    try:
+        stale = float(stale_sec or 7200)
+    except (TypeError, ValueError):
+        stale = 7200.0
+    if n <= 0:
+        return "注意", "暂无数据通道：请检查监控目录与数据源（完整诊断请运行 --diagnose）"
+    if g <= 0:
+        return "异常", "共 %d 个通道但无一可信（Good=False）：数据源可能丢失，请查监控目录与源文件" % n
+    if age > stale:
+        return "注意", "通道 %d/%d 可信，但数据已 %.0f 秒未更新（阈值 %.0f 秒）：可能是色谱无新周期，请确认仪器周期" % (
+            g, n, age, stale)
+    if g < n:
+        return "注意", "通道 %d/%d 可信，数据年龄 %.0f 秒：有 %d 个通道不可信，请查对应数据源" % (
+            g, n, age, n - g)
+    return "正常", "通道 %d/%d 正常，数据年龄 %.0f 秒" % (g, n, age)
+
+
 class OpcUaApp:
     """构建并维护 OPC UA 地址空间。"""
 
@@ -518,10 +630,30 @@ class OpcUaApp:
         self._last_export = -1e9
         self._export_lock = threading.Lock()   # asyncua 把同步方法放进线程池执行，必须防并发
         self._beats = 0
+        # ---- 数据传输检测与发送（v2.4）----
+        self._loop = None                      # start() 里保存事件循环，供同步方法桥接 async _upsert
+        self._test_counter = 0
+        self._test_cycle = 0
+        self._last_test_send = -1e9
+        self._test_send_lock = threading.Lock()
+        self._echo_count = 0
+        self._echo_lock = threading.Lock()
+        self._server_start_monotonic = None
+        self._server_start_str = ""
+        self._last_data_change_monotonic = None
+        self._last_data_change_str = ""
+        self._channel_count = 0
+        self._good_count = 0
+        self._total_points = 0
+        self.n_diag = None
+        self.diag_nodes = {}
 
     async def start(self):
         from asyncua import Server, ua
         cfg = self.cfg
+        self._loop = asyncio.get_running_loop()
+        self._server_start_monotonic = time.monotonic()
+        self._server_start_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         um = ChromUserManager(cfg.get("users"), cfg.get("allow_anonymous", True))
         self.user_manager = um
         try:
@@ -586,6 +718,45 @@ class OpcUaApp:
         self.n_export = await self.root.add_method(
             self.idx, "ExportCSV", self._export_csv, [],
             [ua.VariantType.String])
+        # ---- 数据传输检测与发送（v2.4）：Diagnostics 只读诊断节点 + 两个方法 ----
+        # 全部只读：远程用户最高只读（ChromUserManager），这些变量同样不可被客户端改写；
+        # 发送测试数据走方法调用（服务端内部 _upsert），不开任何写权限。
+        self.n_diag = await self.root.add_object(self.idx, "Diagnostics")
+        vt = ua.VariantType
+        self.diag_nodes = dict(
+            test_signal=await self.n_diag.add_variable(
+                self.idx, "TestSignal", ua.Variant(0.0, vt.Double)),
+            test_counter=await self.n_diag.add_variable(
+                self.idx, "TestCounter", ua.Variant(0, vt.Int64)),
+            channel_count=await self.n_diag.add_variable(
+                self.idx, "ChannelCount", ua.Variant(0, vt.Int32)),
+            good_count=await self.n_diag.add_variable(
+                self.idx, "GoodChannelCount", ua.Variant(0, vt.Int32)),
+            total_points=await self.n_diag.add_variable(
+                self.idx, "TotalPoints", ua.Variant(0, vt.Int64)),
+            last_change=await self.n_diag.add_variable(
+                self.idx, "LastDataChangeTime", ""),
+            data_age=await self.n_diag.add_variable(
+                self.idx, "DataAgeSeconds", ua.Variant(0.0, vt.Double)),
+            status=await self.n_diag.add_variable(
+                self.idx, "TransmissionStatus", "无数据"),
+            start_time=await self.n_diag.add_variable(
+                self.idx, "ServerStartTime", self._server_start_str),
+            uptime=await self.n_diag.add_variable(
+                self.idx, "UptimeSeconds", ua.Variant(0.0, vt.Double)),
+            diagnosis_level=await self.n_diag.add_variable(
+                self.idx, "DiagnosisLevel", "注意"),
+            diagnosis_summary=await self.n_diag.add_variable(
+                self.idx, "DiagnosisSummary", "服务刚启动，等待第一轮扫描"),
+            last_diagnosis_time=await self.n_diag.add_variable(
+                self.idx, "LastDiagnosisTime", ""),
+        )
+        self.n_send_test = await self.root.add_method(
+            self.idx, "SendTestData", self._send_test_data, [],
+            [vt.String, vt.Int64])
+        self.n_echo = await self.root.add_method(
+            self.idx, "EchoTest", self._echo_test, [vt.String],
+            [vt.String, vt.String, vt.Int64])
         await self.server.start()
         get_log().info("OPC UA 服务已启动：%s", cfg["endpoint"])
 
@@ -623,14 +794,117 @@ class OpcUaApp:
                 await self.n_al_time.write_value(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         except Exception:  # noqa
             pass
+    def _diag_age_uptime(self):
+        now = time.monotonic()
+        uptime = (now - self._server_start_monotonic) if self._server_start_monotonic else 0.0
+        age = (now - self._last_data_change_monotonic) if self._last_data_change_monotonic else 0.0
+        return float(age), float(uptime)
+
+    async def _write_diag(self):
+        """把当前诊断计数写进 Diagnostics 节点（beat 与 apply_snapshot 共用）。"""
+        if not self.diag_nodes:
+            return
+        from asyncua import ua
+        age, uptime = self._diag_age_uptime()
+        stale = self.cfg.get("transmission_stale_sec", 7200)
+        status = _transmission_status(self._channel_count, self._good_count, age, stale)
+        d = self.diag_nodes
+        await d["test_counter"].write_value(ua.Variant(int(self._test_counter), ua.VariantType.Int64))
+        await d["test_signal"].write_value(ua.Variant(float(math.sin(float(self._test_counter))),
+                                                       ua.VariantType.Double))
+        await d["channel_count"].write_value(ua.Variant(int(self._channel_count), ua.VariantType.Int32))
+        await d["good_count"].write_value(ua.Variant(int(self._good_count), ua.VariantType.Int32))
+        await d["total_points"].write_value(ua.Variant(int(self._total_points), ua.VariantType.Int64))
+        await d["last_change"].write_value(self._last_data_change_str or "")
+        await d["data_age"].write_value(ua.Variant(float(age), ua.VariantType.Double))
+        await d["status"].write_value(status)
+        await d["uptime"].write_value(ua.Variant(float(uptime), ua.VariantType.Double))
+        # 智能诊断轻量摘要（服务端证据，beat/apply_snapshot 每次刷新；完整诊断见 diagnose()）
+        if "diagnosis_level" in d:
+            level, summary = _light_diagnosis(self._channel_count, self._good_count, age, stale)
+            await d["diagnosis_level"].write_value(level)
+            await d["diagnosis_summary"].write_value(summary)
+            await d["last_diagnosis_time"].write_value(
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
     async def beat(self):
         self._beats += 1
+        self._test_counter += 1
         try:
             await self.n_beat.write_value(self._beats)
             await self.n_scan.write_value(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            await self._write_diag()
         except Exception:  # noqa
             pass
+
+    async def _upsert_test(self, record):
+        """只把测试记录写进 Station_TEST（与 apply_snapshot 共用同一把锁串行化）。
+        绝不改 latest_records、绝不把真实通道标 Good=False。"""
+        async with self._lock:
+            await self._upsert(record)
+
+    @staticmethod
+    def _send_test_data(parent=None):
+        """OPC UA 方法（线程池执行）：生成一条合成谱图并发送到 Station_TEST 测试通道。
+
+        受 allow_test_send 开关与 test_send_min_interval_sec 限流控制；
+        通过事件循环桥接 async _upsert_test，真实通道的 Good 状态不受影响。
+        返回 [说明 String, 点数 Int64]；被拒绝时返回标准状态码。
+        """
+        from asyncua import ua
+        app = OpcUaApp.current
+        cfg = app.cfg
+        if not cfg.get("allow_test_send", True):
+            get_log().warning("SendTestData 被调用，但 allow_test_send=false，已拒绝")
+            return ua.StatusCode(ua.StatusCodes.BadUserAccessDenied)
+        if not app._test_send_lock.acquire(blocking=False):
+            return ua.StatusCode(ua.StatusCodes.BadTooManyOperations)
+        try:
+            now = time.monotonic()
+            if now - app._last_test_send < float(cfg.get("test_send_min_interval_sec", 5)):
+                return ua.StatusCode(ua.StatusCodes.BadTooManyOperations)
+            app._last_test_send = now
+            app._test_cycle += 1
+            record = make_test_record(cycle_id=app._test_cycle)
+            loop = app._loop
+            if loop is None or not loop.is_running():
+                get_log().error("SendTestData 失败：服务事件循环不可用")
+                return ua.StatusCode(ua.StatusCodes.BadInternalError)
+            fut = asyncio.run_coroutine_threadsafe(app._upsert_test(record), loop)
+            try:
+                fut.result(timeout=10)
+            except Exception as e:  # noqa
+                get_log().error("SendTestData 写入测试通道失败：%s", chrom_core.clean_text(str(e), 200))
+                return ua.StatusCode(ua.StatusCodes.BadInternalError)
+            n = int(record["num_points"])
+            get_log().info("远程调用 SendTestData：已发送测试数据到 Station_TEST（%d 点，周期 %d）",
+                           n, app._test_cycle)
+            return [ua.Variant("已发送测试数据到 Station_TEST（%d 点）" % n, ua.VariantType.String),
+                    ua.Variant(n, ua.VariantType.Int64)]
+        finally:
+            app._test_send_lock.release()
+
+    @staticmethod
+    def _echo_test(parent=None, text=""):
+        """OPC UA 方法（线程池执行）：原样回显入参，证明双向传输通畅。
+
+        返回 [回显 String, 服务端时间 String, 调用计数 Int64]。
+        日志里的外部文本一律经 clean_text 清洗，防日志注入。
+        """
+        from asyncua import ua
+        app = OpcUaApp.current
+        raw = text
+        if hasattr(raw, "Value"):
+            raw = raw.Value
+        echo = "" if raw is None else str(raw)
+        with app._echo_lock:
+            app._echo_count += 1
+            count = app._echo_count
+        get_log().info("远程调用 EchoTest（第 %d 次）：%s", count,
+                       chrom_core.clean_text(echo, 80))
+        return [ua.Variant(echo, ua.VariantType.String),
+                ua.Variant(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), ua.VariantType.String),
+                ua.Variant(int(count), ua.VariantType.Int64)]
 
     @staticmethod
     def _export_csv(parent=None):
@@ -664,19 +938,33 @@ class OpcUaApp:
             self.latest_records = records
             self.revision += 1
             seen = set()
+            ok_cnt, total_pts = 0, 0
             for r in records:
                 seen.add((r["analyzer"], r["app"], r["stream"], r["det"]))
                 try:
                     await self._upsert(r)
+                    ok_cnt += 1
+                    total_pts += int(r.get("num_points") or 0)
                 except Exception as e:  # noqa
                     get_log().error("更新节点失败（%s）：%s", r["source"], e)
             # 数据源丢失/读不了时，旧数据仍留在节点里；必须明确标记为"不可信"，不能让 DCS 把陈旧值当真
+            # Station_TEST 测试通道除外：它由 SendTestData 单独维护，不随真实快照变 Good。
             for key, nodes in self.devices.items():
-                if key not in seen:
+                if key not in seen and key[0] != "TEST":
                     try:
                         await nodes["good"].write_value(False)
                     except Exception:  # noqa
                         pass
+            # Diagnostics：通道计数只统计真实快照（不含 Station_TEST），诚实反映真实数据新鲜度
+            self._channel_count = len(records)
+            self._good_count = ok_cnt
+            self._total_points = total_pts
+            self._last_data_change_monotonic = time.monotonic()
+            self._last_data_change_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                await self._write_diag()
+            except Exception:  # noqa
+                pass
             try:
                 await self.n_server_info.write_value(__version__)
             except Exception:  # noqa
@@ -866,6 +1154,774 @@ async def run_server(cfg, stop_evt=None):
         ALERTS.pop("probes", None)
         await app.server.stop()
         get_log().info("服务已停止")
+
+
+# ---------------------------------------------------------------------------
+# 数据传输检测（客户端）：真的连上、读数、订阅、回显，证明数据在传
+# ---------------------------------------------------------------------------
+
+class _SubHandler:
+    """订阅回调：只记录通知（节点、值、时刻），不做任何写操作。"""
+
+    def __init__(self):
+        self.events = []   # [(monotonic, nodeid_str, value)]
+
+    def datachange_notification(self, node, val, data):
+        try:
+            nid = str(node.nodeid) if hasattr(node, "nodeid") else str(node)
+        except Exception:  # noqa
+            nid = "?"
+        self.events.append((time.monotonic(), nid, val))
+
+
+async def transmission_check_async(endpoint, namespace_uri="urn:chromextract:opcua",
+                                   security="none", cert_dir="certs", user=None,
+                                   password=None, duration_sec=6, do_send_test=False):
+    """OPC UA 数据传输检测（只读 + 方法调用，绝不写变量）。
+
+    返回 {"ok": bool, "endpoint": endpoint, "steps": [{name, ok, detail, latency_ms}, ...]}。
+    任何一步失败都记录在 steps 里并继续能做的步骤，不抛异常（连接失败时直接返回）。
+    订阅一步：订阅建立成功即算传输通道可用；窗口内无变化多半是心跳/扫描间隔较长，
+    detail 里会如实说明，不误判为失败。无真实通道时读曲线一步记为跳过（ok=True）。
+    """
+    from asyncua import Client, ua
+
+    steps = []
+
+    def _add(name, ok, detail, latency_ms=None):
+        steps.append(dict(name=name, ok=bool(ok), detail=str(detail),
+                          latency_ms=(round(float(latency_ms), 1) if latency_ms is not None else None)))
+
+    endpoint = str(endpoint or "").strip()
+    try:
+        dur = max(0.5, float(duration_sec or 6))
+    except (TypeError, ValueError):
+        dur = 6.0
+    client = Client(url=endpoint, timeout=10)
+    connected = False
+    try:
+        # 1) 连接建会话
+        t0 = time.perf_counter()
+        try:
+            if user is not None:
+                client.set_user(user)
+                client.set_password(password or "")
+            sec = str(security or "none").lower()
+            if sec != "none":
+                from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+                client.application_uri = APP_URI
+                await client.set_security(
+                    SecurityPolicyBasic256Sha256,
+                    certificate=os.path.join(cert_dir, "server_cert.der"),
+                    private_key=os.path.join(cert_dir, "server_key.pem"),
+                    mode=(ua.MessageSecurityMode.SignAndEncrypt if sec == "sign_encrypt"
+                          else ua.MessageSecurityMode.Sign))
+            await client.connect()
+            connected = True
+            ns = await client.get_namespace_index(namespace_uri)
+            root = await client.nodes.objects.get_child(["%d:Chromatograph" % ns])
+            _add("连接建会话", True, "已连接 %s（命名空间 ns=%d）" % (endpoint, ns),
+                 (time.perf_counter() - t0) * 1000)
+        except Exception as e:  # noqa
+            _add("连接建会话", False, "%s: %s" % (type(e).__name__, e),
+                 (time.perf_counter() - t0) * 1000)
+            return dict(ok=False, endpoint=endpoint, steps=steps)
+
+        # 2) 读 ServerVersion
+        t0 = time.perf_counter()
+        try:
+            ver = await (await root.get_child(["%d:ServerVersion" % ns])).read_value()
+            _add("读 ServerVersion", True, "服务版本：%s" % ver,
+                 (time.perf_counter() - t0) * 1000)
+        except Exception as e:  # noqa
+            _add("读 ServerVersion", False, "%s: %s" % (type(e).__name__, e),
+                 (time.perf_counter() - t0) * 1000)
+
+        # 3) 读 Diagnostics/TestCounter（顺带读状态，方便人看）
+        t0 = time.perf_counter()
+        diag = None
+        try:
+            diag = await root.get_child(["%d:Diagnostics" % ns])
+            counter = await (await diag.get_child(["%d:TestCounter" % ns])).read_value()
+            status = await (await diag.get_child(["%d:TransmissionStatus" % ns])).read_value()
+            _add("读 Diagnostics/TestCounter", True,
+                 "TestCounter=%s，TransmissionStatus=%s" % (counter, status),
+                 (time.perf_counter() - t0) * 1000)
+        except Exception as e:  # noqa
+            _add("读 Diagnostics/TestCounter", False,
+                 "%s: %s（服务端可能是旧版本，没有 Diagnostics 节点）" % (type(e).__name__, e),
+                 (time.perf_counter() - t0) * 1000)
+
+        # 4) 订阅 TestSignal + Heartbeat
+        t0 = time.perf_counter()
+        try:
+            if diag is None:
+                diag = await root.get_child(["%d:Diagnostics" % ns])
+            sig_node = await diag.get_child(["%d:TestSignal" % ns])
+            hb_node = await root.get_child(["%d:Heartbeat" % ns])
+            handler = _SubHandler()
+            sub = await client.create_subscription(100, handler)
+            try:
+                await sub.subscribe_data_change([sig_node, hb_node])
+                await asyncio.sleep(dur)
+            finally:
+                try:
+                    await sub.delete()
+                except Exception:  # noqa
+                    pass
+            ev = handler.events
+            if len(ev) >= 2:
+                gaps = [ev[i + 1][0] - ev[i][0] for i in range(len(ev) - 1)]
+                avg = sum(gaps) / len(gaps) if gaps else 0.0
+                detail = "收到 %d 条通知，平均间隔 %.2f 秒" % (len(ev), avg)
+            elif len(ev) == 1:
+                detail = ("收到 1 条通知（订阅初始值），窗口内无新变化；"
+                          "心跳随扫描轮次更新，间隔较长时属正常，订阅通道本身可用")
+            else:
+                detail = ("订阅已建立，但窗口内未收到通知；心跳随扫描轮次更新"
+                          "（扫描间隔较长时窗口内无变化属正常），请加长 --check-seconds 再确认")
+            _add("订阅 TestSignal+Heartbeat", True, detail,
+                 (time.perf_counter() - t0) * 1000)
+        except Exception as e:  # noqa
+            _add("订阅 TestSignal+Heartbeat", False, "%s: %s" % (type(e).__name__, e),
+                 (time.perf_counter() - t0) * 1000)
+
+        # 5) 读一个真实通道的 Trace 数组（无通道记跳过，不崩溃）
+        t0 = time.perf_counter()
+        try:
+            found = None
+            for st in await root.get_children():
+                sname = (await st.read_browse_name()).Name
+                if not sname.startswith("Station_") or sname == "Station_TEST":
+                    continue
+                for dev in await st.get_children():
+                    dname = (await dev.read_browse_name()).Name
+                    if dname.startswith("App"):
+                        found = (sname, dname, dev)
+                        break
+                if found:
+                    break
+            if found is None:
+                _add("读真实通道曲线", True,
+                     "跳过（无数据）：暂无真实检测器通道，传输通道本身已由订阅证明可用",
+                     (time.perf_counter() - t0) * 1000)
+            else:
+                sname, dname, dev = found
+                npts = await (await dev.get_child(
+                    ["%d:LatestCycle" % ns, "%d:NumPoints" % ns])).read_value()
+                arr = await (await dev.get_child(
+                    ["%d:Trace" % ns, "%d:ValueArray" % ns])).read_value()
+                n = len(arr) if arr is not None else 0
+                consistent = (int(npts or 0) == n)
+                _add("读真实通道曲线", consistent and n > 0,
+                     "%s/%s：NumPoints=%s，ValueArray %d 点%s" % (
+                         sname, dname, npts, n, "" if consistent else "（不一致！）"),
+                     (time.perf_counter() - t0) * 1000)
+        except Exception as e:  # noqa
+            _add("读真实通道曲线", False, "%s: %s" % (type(e).__name__, e),
+                 (time.perf_counter() - t0) * 1000)
+
+        # 6) EchoTest 往返
+        t0 = time.perf_counter()
+        try:
+            probe = "ChromExtractOPC-transmission-check"
+            out = await root.call_method("%d:EchoTest" % ns,
+                                         ua.Variant(probe, ua.VariantType.String))
+            vals = list(out) if isinstance(out, (list, tuple)) else [out]
+            echoed = vals[0] if vals else None
+            if hasattr(echoed, "Value"):
+                echoed = echoed.Value
+            ok = (echoed == probe)
+            _add("EchoTest 往返", ok,
+                 "发送 %r，收到 %r（服务端时间 %s，计数 %s）" % (
+                     probe, echoed,
+                     vals[1] if len(vals) > 1 else "?",
+                     vals[2] if len(vals) > 2 else "?"),
+                 (time.perf_counter() - t0) * 1000)
+        except Exception as e:  # noqa
+            _add("EchoTest 往返", False,
+                 "%s: %s（服务端可能是旧版本，没有 EchoTest 方法）" % (type(e).__name__, e),
+                 (time.perf_counter() - t0) * 1000)
+
+        # 7) 可选：SendTestData 并验证 Station_TEST 可读
+        if do_send_test:
+            t0 = time.perf_counter()
+            try:
+                out = await root.call_method("%d:SendTestData" % ns)
+                vals = list(out) if isinstance(out, (list, tuple)) else [out]
+                msg = vals[0] if vals else ""
+                if hasattr(msg, "Value"):
+                    msg = msg.Value
+                test_st = await root.get_child(["%d:Station_TEST" % ns])
+                devs = [d for d in await test_st.get_children()
+                        if (await d.read_browse_name()).Name.startswith("App")]
+                if not devs:
+                    _add("SendTestData 发送测试数据", False,
+                         "方法已调用（%s），但 Station_TEST 下没有通道" % msg,
+                         (time.perf_counter() - t0) * 1000)
+                else:
+                    dev = devs[0]
+                    npts = await (await dev.get_child(
+                        ["%d:LatestCycle" % ns, "%d:NumPoints" % ns])).read_value()
+                    arr = await (await dev.get_child(
+                        ["%d:Trace" % ns, "%d:ValueArray" % ns])).read_value()
+                    n = len(arr) if arr is not None else 0
+                    _add("SendTestData 发送测试数据", n > 0 and int(npts or 0) == n,
+                         "%s；Station_TEST 可读：NumPoints=%s，ValueArray %d 点" % (msg, npts, n),
+                         (time.perf_counter() - t0) * 1000)
+            except Exception as e:  # noqa
+                _add("SendTestData 发送测试数据", False,
+                     "%s: %s" % (type(e).__name__, e),
+                     (time.perf_counter() - t0) * 1000)
+
+        return dict(ok=all(s["ok"] for s in steps), endpoint=endpoint, steps=steps)
+    finally:
+        if connected:
+            try:
+                await client.disconnect()
+            except Exception:  # noqa
+                pass
+
+
+def _print_transmission_result(result):
+    print("数据传输检测：%s" % result.get("endpoint", ""))
+    for s in result.get("steps", []):
+        lat = ("（%.0f ms）" % s["latency_ms"]) if s.get("latency_ms") is not None else ""
+        print("  %s %s：%s%s" % ("[ 通过 ]" if s["ok"] else "[ 失败 ]", s["name"], s["detail"], lat))
+    print("[ 通过 ] 数据传输正常" if result.get("ok") else "[ 失败 ] 数据传输有问题，见上面失败步骤")
+
+
+def run_transmission_check(endpoint=None, cfg=None, duration_sec=6, do_send_test=False,
+                           security=None, cert_dir=None, user=None, password=None,
+                           namespace_uri=None):
+    """同步封装：跑一遍 transmission_check_async，打印中文报告，返回 0/1。"""
+    _force_utf8_stdout()
+    if not endpoint:
+        endpoint = _local_endpoint((cfg or {}).get("endpoint") or DEFAULT_CONFIG["endpoint"])
+    if security is None:
+        security = (cfg or {}).get("security", "none")
+    if cert_dir is None:
+        base = (cfg or {}).get("_base_dir") or program_dir()
+        cd = (cfg or {}).get("cert_dir") or "certs"
+        cert_dir = cd if os.path.isabs(cd) else os.path.join(base, cd)
+    if namespace_uri is None:
+        namespace_uri = (cfg or {}).get("namespace_uri") or "urn:chromextract:opcua"
+    result = asyncio.run(transmission_check_async(
+        endpoint, namespace_uri=namespace_uri, security=security, cert_dir=cert_dir,
+        user=user, password=password, duration_sec=duration_sec, do_send_test=do_send_test))
+    _print_transmission_result(result)
+    return 0 if result.get("ok") else 1
+
+
+# ---------------------------------------------------------------------------
+# 智能诊断（纯规则，离线可用）：配置—服务—数据—传输—日志五层证据 + 处理步骤
+# ---------------------------------------------------------------------------
+
+_LOG_KEYWORDS = (
+    ("扫描出错", ("扫描出错",)),
+    ("更新节点失败", ("更新节点失败",)),
+    ("登录失败", ("登录失败",)),
+    ("证书拒绝", ("已拒绝不在白名单", "BadCertificateUntrusted", "已拒绝匿名连接")),
+    ("服务无法启动", ("服务无法启动", "服务没能启动")),
+)
+
+
+def _scan_log_tail(log_path, max_lines=200):
+    """读日志尾部并统计错误关键词（只计数 + 摘录首条，不把整段日志塞进报告）。"""
+    counts = {label: 0 for label, _ in _LOG_KEYWORDS}
+    result = dict(exists=False, path=str(log_path or ""), lines_read=0,
+                  counts=counts, total_hits=0, first_excerpt="")
+    if not log_path or not os.path.isfile(log_path):
+        return result
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return result
+    tail = lines[-max(1, int(max_lines or 200)):]
+    result["exists"] = True
+    result["lines_read"] = len(tail)
+    for line in tail:
+        hit = False
+        for label, pats in _LOG_KEYWORDS:
+            if any(p in line for p in pats):
+                counts[label] += 1
+                hit = True
+        if hit and not result["first_excerpt"]:
+            result["first_excerpt"] = chrom_core.clean_text(line.strip(), 200)
+    result["total_hits"] = sum(counts.values())
+    return result
+
+
+def _diagnose_channels(channels, channel_count=None, good_count=None):
+    """通道健康判定（纯函数）：输入逐通道证据列表，输出一条 finding。
+
+    channels 为 None 表示 OPC 未连接、拿不到证据；为空列表表示无真实通道。
+    每条通道：{station, device, good, last_update, num_points, trace_len, min_raw, max_raw}
+    """
+    if channels is None:
+        return dict(name="通道健康", level="fail",
+                    evidence="无法读取通道（服务未连接，无逐通道证据）",
+                    advice="先恢复服务连接（见服务存活一项），再重新运行 --diagnose 看通道明细")
+    n = len(channels)
+    if channel_count is None:
+        channel_count = n
+    good_n = sum(1 for c in channels if c.get("good"))
+    if good_count is None:
+        good_count = good_n
+    if n == 0:
+        return dict(name="通道健康", level="fail",
+                    evidence="ChannelCount=%s，无真实检测器通道" % channel_count,
+                    advice="先解决监控目录/数据源（见监控目录一项）：确认 watch_dirs 里有 *_V3.db/.mbd "
+                           "且 DataBrowser 在产生数据，等一轮扫描后重新运行 --diagnose")
+    bad = [c for c in channels if not c.get("good")]
+    mismatch = [c for c in channels
+                if c.get("trace_len") is not None and c.get("num_points") is not None
+                and int(c["trace_len"]) != int(c["num_points"])]
+    sanity = [c for c in channels
+              if c.get("min_raw") is not None and c.get("max_raw") is not None
+              and float(c["min_raw"]) > float(c["max_raw"])]
+    names = lambda lst: "、".join("%s/%s" % (c.get("station", "?"), c.get("device", "?"))
+                                  for c in lst[:5]) + ("等" if len(lst) > 5 else "")
+    ev = "共 %d 个通道，可信 %d 个" % (n, good_n)
+    if bad:
+        ev += "；不可信（Good=False）：%s" % names(bad)
+    if mismatch:
+        ev += "；数组长度不一致：%s" % names(mismatch)
+    if sanity:
+        ev += "；MinRaw>MaxRaw 异常：%s" % names(sanity)
+    if mismatch or sanity:
+        return dict(name="通道健康", level="fail", evidence=ev,
+                    advice="解析异常：保留出问题通道对应的源文件（不要覆盖），用 --list/--extract "
+                           "对该文件复现解析，确认文件是否损坏或被写一半；复现材料留给技术支持排查")
+    if bad and good_n == 0:
+        return dict(name="通道健康", level="fail", evidence=ev,
+                    advice="数据源丢失：通道旧值已标 Good=False 不可信。请查监控目录里源文件是否还在、"
+                           "DataBrowser 是否停写、文件是否被移走；恢复数据源后等一轮扫描（poll_seconds）"
+                           "看 Good 是否变回 True，不要直接删节点")
+    if bad:
+        return dict(name="通道健康", level="warn", evidence=ev,
+                    advice="部分通道数据源丢失：逐个查不可信通道对应的源文件是否还在、检测器是否停机；"
+                           "恢复后等一轮扫描复核，其余正常通道可继续使用")
+    return dict(name="通道健康", level="ok", evidence=ev, advice="无需处理")
+
+
+async def _collect_opc_evidence_async(endpoint, namespace_uri="urn:chromextract:opcua",
+                                      security="none", cert_dir="certs", user=None,
+                                      password=None, heartbeat_wait_sec=2.0):
+    """诊断用的一次性 OPC 只读采集：心跳两次 + Diagnostics + 逐通道明细（只连一次）。"""
+    from asyncua import Client, ua
+    out = dict(connected=False, error="", server_version="", heartbeat1=None,
+               heartbeat2=None, last_scan_time="", diag={}, channels=[], test_present=False)
+    client = Client(url=str(endpoint or ""), timeout=10)
+    try:
+        if user is not None:
+            client.set_user(user)
+            client.set_password(password or "")
+        sec = str(security or "none").lower()
+        if sec != "none":
+            from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+            client.application_uri = APP_URI
+            await client.set_security(
+                SecurityPolicyBasic256Sha256,
+                certificate=os.path.join(cert_dir, "server_cert.der"),
+                private_key=os.path.join(cert_dir, "server_key.pem"),
+                mode=(ua.MessageSecurityMode.SignAndEncrypt if sec == "sign_encrypt"
+                      else ua.MessageSecurityMode.Sign))
+        await client.connect()
+        out["connected"] = True
+        ns = await client.get_namespace_index(namespace_uri)
+        root = await client.nodes.objects.get_child(["%d:Chromatograph" % ns])
+        try:
+            out["server_version"] = await (await root.get_child(
+                ["%d:ServerVersion" % ns])).read_value()
+        except Exception:  # noqa
+            pass
+        hb_node = await root.get_child(["%d:Heartbeat" % ns])
+        scan_node = await root.get_child(["%d:LastScanTime" % ns])
+        out["heartbeat1"] = await hb_node.read_value()
+        out["last_scan_time"] = await scan_node.read_value()
+        diag = {}
+        try:
+            dnode = await root.get_child(["%d:Diagnostics" % ns])
+            for key, bname in (("channel_count", "ChannelCount"),
+                               ("good_count", "GoodChannelCount"),
+                               ("total_points", "TotalPoints"),
+                               ("last_change", "LastDataChangeTime"),
+                               ("data_age", "DataAgeSeconds"),
+                               ("status", "TransmissionStatus"),
+                               ("test_counter", "TestCounter")):
+                try:
+                    diag[key] = await (await dnode.get_child(["%d:%s" % (ns, bname)])).read_value()
+                except Exception:  # noqa
+                    diag[key] = None
+        except Exception:  # noqa
+            diag = {}
+        out["diag"] = diag
+        channels = []
+        for st in await root.get_children():
+            sname = (await st.read_browse_name()).Name
+            if not sname.startswith("Station_"):
+                continue
+            if sname == "Station_TEST":
+                out["test_present"] = True
+                continue
+            for dev in await st.get_children():
+                dname = (await dev.read_browse_name()).Name
+                if not dname.startswith("App"):
+                    continue
+                if len(channels) >= 20:
+                    break
+                rec = dict(station=sname, device=dname, good=None, last_update="",
+                           num_points=None, trace_len=None, min_raw=None, max_raw=None)
+                try:
+                    rec["good"] = bool(await (await dev.get_child(
+                        ["%d:Status" % ns, "%d:Good" % ns])).read_value())
+                    rec["last_update"] = await (await dev.get_child(
+                        ["%d:Status" % ns, "%d:LastUpdate" % ns])).read_value()
+                    rec["num_points"] = await (await dev.get_child(
+                        ["%d:LatestCycle" % ns, "%d:NumPoints" % ns])).read_value()
+                    rec["min_raw"] = await (await dev.get_child(
+                        ["%d:LatestCycle" % ns, "%d:MinRaw" % ns])).read_value()
+                    rec["max_raw"] = await (await dev.get_child(
+                        ["%d:LatestCycle" % ns, "%d:MaxRaw" % ns])).read_value()
+                    arr = await (await dev.get_child(
+                        ["%d:Trace" % ns, "%d:ValueArray" % ns])).read_value()
+                    rec["trace_len"] = len(arr) if arr is not None else 0
+                except Exception:  # noqa
+                    pass
+                channels.append(rec)
+            if len(channels) >= 20:
+                break
+        out["channels"] = channels
+        wait = max(0.0, float(heartbeat_wait_sec or 0))
+        if wait:
+            await asyncio.sleep(wait)
+        try:
+            out["heartbeat2"] = await hb_node.read_value()
+            out["last_scan_time"] = await scan_node.read_value()
+        except Exception:  # noqa
+            out["heartbeat2"] = out["heartbeat1"]
+        return out
+    except Exception as e:  # noqa
+        out["error"] = "%s: %s" % (type(e).__name__, e)
+        return out
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa
+            pass
+
+
+def _collect_opc_evidence(endpoint, namespace_uri="urn:chromextract:opcua",
+                          security="none", cert_dir="certs", user=None,
+                          password=None, heartbeat_wait_sec=2.0):
+    return asyncio.run(_collect_opc_evidence_async(
+        endpoint, namespace_uri=namespace_uri, security=security, cert_dir=cert_dir,
+        user=user, password=password, heartbeat_wait_sec=heartbeat_wait_sec))
+
+
+def diagnose(cfg, transmission_result=None, log_tail_lines=200,
+             heartbeat_wait_sec=2.0, _opc=None):
+    """智能诊断（纯规则）：收齐配置—服务—数据—传输—日志五层证据并给出处理步骤。
+
+    cfg：配置 dict（可为未规整的原始配置，内部会复制一份走 normalize_config 复核，
+    不改调用方的 cfg）。transmission_result：已跑的 transmission_check_async 结果，
+    传输健康一项直接复用它，不在诊断里重跑订阅。_opc 仅供测试注入 OPC 证据。
+    返回 {overall: 正常/注意/异常, findings: [{name, level, evidence, advice}]（按严重度排序）,
+          actions: [去重后的处理清单], endpoint, checked_at, log_scan, opc_connected}。
+    """
+    cfg = dict(cfg or {})
+    base = cfg.get("_base_dir") or program_dir()
+    findings = []
+
+    def _f(name, level, evidence, advice):
+        findings.append(dict(name=name, level=level, evidence=str(evidence), advice=str(advice)))
+
+    # 1) 配置合法性（复用 normalize_config + security_report，不重复造轮子）
+    norm = dict(cfg)
+    norm_ok = True
+    try:
+        normalize_config(norm, base)
+    except Exception as e:  # noqa
+        norm_ok = False
+        _f("配置合法性", "fail", "配置校验失败：%s" % e,
+           "按报错改 config.json 对应项（endpoint 必须 opc.tcp:// 开头、security 只能 none/sign/"
+           "sign_encrypt、users 密码必须是哈希不要手写明文，用 --add-user 生成）；改完运行 "
+           "--check-security 复核，再重启服务")
+        norm = cfg
+    if norm_ok:
+        report = security_report(norm)
+        risks = [m for lv, m in report if lv == "风险"]
+        notes = [m for lv, m in report if lv == "注意"]
+        if risks:
+            _f("配置合法性", "warn",
+               "配置合法，但安全体检有 %d 项风险：%s" % (len(risks), "；".join(risks)),
+               "逐项处理上面风险（例如有密码却未加密时同时启用 sign_encrypt、关掉 "
+               "allow_insecure_fallback）；处理后运行 --check-security 复核")
+        else:
+            _f("配置合法性", "ok",
+               "配置合法（endpoint=%s，security=%s，安全体检无风险，注意事项 %d 项）" % (
+                   norm.get("endpoint", ""), norm.get("security", "none"), len(notes)),
+               "无需处理")
+
+    # 2) 监控目录（复用 watch_dir_warnings + find_inputs 计数）
+    warnings = watch_dir_warnings(norm)
+    total_files = 0
+    for d in (norm.get("watch_dirs") or []):
+        try:
+            total_files += len(chrom_core.find_inputs([d]))
+        except Exception:  # noqa
+            pass
+    if warnings:
+        _f("监控目录", "fail",
+           "；".join(warnings) + "（共找到 %d 个数据文件）" % total_files,
+           "装好了却没数据多半是目录不对：1) 打开 config.json 核对 watch_dirs 是否为存放 "
+           "*_V3.db/.mbd 的文件夹（反斜杠写 \\\\ 或改用 /）；2) 确认文件夹里真有 *_V3.db/.mbd "
+           "且 DataBrowser 在写；3) 可运行 --set-watch-dir <文件夹> 写入；4) 等一轮扫描"
+           "（poll_seconds=%s 秒）后重新运行 --diagnose 复核" % norm.get("poll_seconds", 30))
+    else:
+        _f("监控目录", "ok",
+           "%d 个监控目录，共找到 %d 个 *_V3.db/.mbd 文件" % (
+               len(norm.get("watch_dirs") or []), total_files),
+           "无需处理")
+
+    # OPC 证据（只连一次；传输检测已确认连不上时不再重复等超时）
+    endpoint = _local_endpoint(norm.get("endpoint") or DEFAULT_CONFIG["endpoint"])
+    tx_connect_failed = False
+    if transmission_result:
+        for s in transmission_result.get("steps", []):
+            if s.get("name") == "连接建会话" and not s.get("ok"):
+                tx_connect_failed = True
+    if _opc is not None:
+        opc = _opc
+    elif tx_connect_failed:
+        opc = dict(connected=False, error="传输检测已确认无法连接", channels=[], diag={})
+    else:
+        cd = norm.get("cert_dir") or "certs"
+        cert_dir = cd if os.path.isabs(cd) else os.path.join(base, cd)
+        try:
+            opc = _collect_opc_evidence(
+                endpoint, namespace_uri=norm.get("namespace_uri") or "urn:chromextract:opcua",
+                security=norm.get("security", "none"), cert_dir=cert_dir,
+                heartbeat_wait_sec=heartbeat_wait_sec)
+        except Exception as e:  # noqa
+            opc = dict(connected=False, error="%s: %s" % (type(e).__name__, e),
+                       channels=[], diag={})
+    connected = bool(opc.get("connected"))
+    diag = opc.get("diag") or {}
+    poll = int(norm.get("poll_seconds", 30) or 30)
+    sec_mode = str(norm.get("security", "none")).lower()
+
+    # 3) 服务存活（心跳推进 / LastScanTime 年龄，如实标注判断依据）
+    alive = False
+    if not connected:
+        if sec_mode == "none":
+            sec_advice = "当前 security=none，客户端不要用加密连接；若客户端报安全策略错误，把客户端改成不加密"
+        else:
+            sec_advice = ("当前 security=%s，客户端必须用 Basic256Sha256 加密 + 信任服务端证书"
+                          "（账号登录时还要填对用户名密码），不要用不加密客户端硬连" % sec_mode)
+        _f("服务存活", "fail",
+           "无法连接 %s：%s" % (endpoint, opc.get("error") or "未知错误"),
+           "服务可能没启动或卡死：1) 确认服务进程在运行（GUI 状态栏/任务管理器看 ChromExtractOPC）；"
+           "2) 查端口占用（endpoint 端口是否被旧实例占用，必要时改 config.json 的 endpoint 端口后重启）；"
+           "3) 看 logs/crash.log 与服务日志尾部；4) 查防火墙是否放行该端口；5) %s" % sec_advice)
+    else:
+        hb1, hb2 = opc.get("heartbeat1"), opc.get("heartbeat2")
+        scan_txt = str(opc.get("last_scan_time") or "")
+        age = None
+        try:
+            age = (datetime.now() - datetime.strptime(scan_txt, "%Y-%m-%d %H:%M:%S")).total_seconds()
+        except (ValueError, TypeError):
+            age = None
+        threshold = poll * 2 + 10
+        advanced = (hb1 is not None and hb2 is not None and hb2 > hb1)
+        if advanced:
+            alive = True
+            _f("服务存活", "ok",
+               "判断依据：Heartbeat %s -> %s（等待 %.0f 秒内推进），LastScanTime=%s" % (
+                   hb1, hb2, float(heartbeat_wait_sec or 0), scan_txt or "（空）"),
+               "无需处理")
+        elif age is not None and age <= threshold:
+            alive = True
+            _f("服务存活", "ok",
+               "判断依据：LastScanTime=%s，年龄 %.0f 秒（阈值 %d 秒）；短窗口内心跳未变属预期"
+               "（扫描间隔 %d 秒），服务在按轮次扫描" % (scan_txt, age, threshold, poll),
+               "无需处理")
+        elif age is not None:
+            _f("服务存活", "fail",
+               "判断依据：Heartbeat %s -> %s 未推进，LastScanTime=%s 年龄 %.0f 秒（阈值 %d 秒），"
+               "服务疑似卡死" % (hb1, hb2, scan_txt, age, threshold),
+               "服务疑似卡死：1) 看服务日志尾部与 logs/crash.log 有无反复报错；2) 重启服务后运行 "
+               "--diagnose 复核心跳；3) 若反复卡死，保留日志与源文件清单排查（先查监控目录是否指向"
+               "网络盘/无权限目录）")
+        else:
+            _f("服务存活", "warn",
+               "已连接但 LastScanTime 为空或无法解析（%r），心跳 %s -> %s，存活证据不足" % (
+                   scan_txt, hb1, hb2),
+               "等一轮扫描（poll_seconds=%d 秒）后重新运行 --diagnose；若仍为空，查服务日志看扫描线程"
+               "是否报错" % poll)
+
+    # 4) 通道健康
+    findings.append(_diagnose_channels(
+        opc.get("channels") if connected else None,
+        channel_count=diag.get("channel_count"), good_count=diag.get("good_count")))
+
+    # 5) 数据新鲜度（区分无新周期与卡死）
+    stale = norm.get("transmission_stale_sec", 7200)
+    if not connected:
+        _f("数据新鲜度", "fail", "服务未连接，无法判断数据新鲜度",
+           "先恢复服务连接（见服务存活一项），再重新运行 --diagnose")
+    else:
+        ch_n = diag.get("channel_count")
+        age_v = diag.get("data_age")
+        last_ch = str(diag.get("last_change") or "")
+        status_v = str(diag.get("status") or "")
+        if not ch_n:
+            _f("数据新鲜度", "fail",
+               "无通道，从未收到数据（LastDataChangeTime=%s，TransmissionStatus=%s）" % (
+                   last_ch or "（空）", status_v or "（空）"),
+               "先解决监控目录/数据源（见监控目录一项），有数据后再看新鲜度")
+        elif not last_ch:
+            _f("数据新鲜度", "fail",
+               "有通道但 LastDataChangeTime 为空，无法确认数据更新时间",
+               "等一轮扫描后重新运行 --diagnose；若仍为空，查服务日志看更新节点是否失败")
+        elif age_v is not None and float(age_v) <= float(stale):
+            _f("数据新鲜度", "ok",
+               "DataAgeSeconds=%.0f <= 阈值 %s，TransmissionStatus=%s，最近更新 %s" % (
+                   float(age_v), stale, status_v, last_ch),
+               "无需处理")
+        elif alive:
+            _f("数据新鲜度", "warn",
+               "DataAgeSeconds=%s > 阈值 %s，但心跳正常，TransmissionStatus=%s" % (
+                   age_v, stale, status_v),
+               "数据较旧但服务活着，多半是色谱无新周期（不是故障）：确认仪器是否在跑周期、"
+               "DataBrowser 是否产生新周期、源文件修改时间是否更新；确认无新周期时无需处理，"
+               "有新周期后等一轮扫描复核；若仪器在跑却无新数据，再查监控目录与源文件")
+        else:
+            _f("数据新鲜度", "fail",
+               "DataAgeSeconds=%s > 阈值 %s 且心跳异常，TransmissionStatus=%s" % (
+                   age_v, stale, status_v),
+               "数据旧且服务疑似卡死：先按服务存活一项恢复服务，再等一轮扫描复核新鲜度")
+
+    # 6) 传输健康（复用传入的传输检测结果，不重跑订阅）
+    if transmission_result is None:
+        _f("传输健康", "warn", "未提供传输检测结果（诊断未重跑订阅）",
+           "运行 --check-transmission（或 --diagnose 会自动先跑一次）补齐连接/订阅/Echo 证据")
+    else:
+        steps = transmission_result.get("steps", [])
+        by_name = {s.get("name"): s for s in steps}
+        failed = [s for s in steps if not s.get("ok")]
+        conn = by_name.get("连接建会话", {})
+        sub = by_name.get("订阅 TestSignal+Heartbeat", {})
+        read_step = by_name.get("读真实通道曲线", {})
+        echo = by_name.get("EchoTest 往返", {})
+        # 订阅一步的耗时包含等待窗口本身，不算延迟；只看连接/读/回显等单步延迟
+        max_lat = max([s["latency_ms"] for s in steps
+                       if s.get("latency_ms") is not None
+                       and s.get("name") != "订阅 TestSignal+Heartbeat"] or [0])
+        ev = "共 %d 步，通过 %d，失败 %d，最大单步延迟 %.0f ms" % (
+            len(steps), len(steps) - len(failed), len(failed), max_lat)
+        if failed:
+            ev += "；失败步骤：" + "、".join(s.get("name", "?") for s in failed)
+        if not conn.get("ok", True):
+            if sec_mode == "none":
+                advice = ("连接失败：1) 确认服务已启动且端口未被占用；2) 查防火墙放行；"
+                          "3) 当前 security=none，客户端必须用不加密连接，不要用加密客户端")
+            else:
+                advice = ("连接失败：1) 确认服务已启动且端口未被占用；2) 查防火墙放行；"
+                          "3) 当前 security=%s，客户端必须用 Basic256Sha256 加密并信任服务端证书"
+                          "（账号模式还要填对用户名密码），不加密客户端会被拒绝" % sec_mode)
+            _f("传输健康", "fail", ev + "；连接详情：%s" % conn.get("detail", ""), advice)
+        elif failed:
+            _f("传输健康", "fail", ev,
+               "按失败步骤逐个处理：读数失败多为旧版服务端缺节点（升级到 v2.4）；Echo 失败同理；"
+               "曲线不一致按通道健康一项保留源文件排查；处理后运行 --check-transmission 复核")
+        elif "未收到通知" in str(sub.get("detail", "")) and read_step.get("ok"):
+            _f("传输健康", "warn",
+               ev + "；订阅窗口内无通知但读取正常：%s" % sub.get("detail", ""),
+               "订阅无通知但读取正常，多为发布间隔/网络抖动：1) 看 poll_seconds=%d，心跳只随扫描"
+               "轮次更新，加大 --check-seconds（如 35 秒）再测；2) 查网络抖动与防火墙是否拦截长连接；"
+               "3) Echo 正常说明双向通道可用，不必重启服务" % poll)
+        elif max_lat > 2000:
+            _f("传输健康", "warn", ev + "；单步延迟偏高",
+               "延迟偏高：查网络负载与服务端机器负载，确认无大文件拷贝占满带宽；"
+               "复测仍高时保留 --check-transmission 输出与服务日志排查")
+        else:
+            _f("传输健康", "ok", ev + "；订阅：%s" % sub.get("detail", ""), "无需处理")
+
+    # 7) 近期日志错误（只计数 + 首条摘录）
+    log_file = norm.get("log_file") or ""
+    if not log_file:
+        scan = dict(exists=False, path="", lines_read=0, counts={}, total_hits=0, first_excerpt="")
+        _f("近期日志", "warn", "无日志可查：config 的 log_file 为空",
+           "在 config.json 设置 log_file（如 logs/server.log）后重启服务，排障时保留最近日志不要清空")
+    else:
+        log_path = log_file if os.path.isabs(log_file) else os.path.join(base, log_file)
+        scan = _scan_log_tail(log_path, log_tail_lines)
+        if not scan["exists"]:
+            _f("近期日志", "warn", "无日志可查：%s 不存在" % log_path,
+               "确认服务已启动过且 log_file 路径正确；服务启动后日志写到该路径，"
+               "排障时保留最近日志不要清空")
+        elif scan["total_hits"] == 0:
+            _f("近期日志", "ok",
+               "尾部 %d 行未发现扫描/节点/登录/证书错误（%s）" % (scan["lines_read"], log_path),
+               "无需处理")
+        else:
+            cnt_txt = "，".join("%s×%d" % (k, v) for k, v in scan["counts"].items() if v)
+            _f("近期日志", "warn",
+               "尾部 %d 行发现错误：%s；首条：%s" % (scan["lines_read"], cnt_txt, scan["first_excerpt"]),
+               "按计数对症：扫描出错查监控目录与源文件可读性；更新节点失败保留源文件排查解析；"
+               "登录失败查账号与是否有反复试错；证书拒绝把可信客户端证书放进 trusted 目录或改对"
+               "客户端安全设置；处理后看日志是否还新增同类错误")
+
+    order = {"fail": 0, "warn": 1, "ok": 2}
+    findings.sort(key=lambda x: order.get(x["level"], 1))
+    if any(f["level"] == "fail" for f in findings):
+        overall = "异常"
+    elif any(f["level"] == "warn" for f in findings):
+        overall = "注意"
+    else:
+        overall = "正常"
+    actions = []
+    for f in findings:
+        if f["level"] in ("fail", "warn") and f["advice"] and f["advice"] != "无需处理" \
+                and f["advice"] not in actions:
+            actions.append(f["advice"])
+    return dict(overall=overall, findings=findings, actions=actions, endpoint=endpoint,
+                checked_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                log_scan=scan, opc_connected=connected)
+
+
+def _print_diagnosis_result(result):
+    icons = {"ok": "[ 通过 ]", "warn": "[ 注意 ]", "fail": "[ 失败 ]"}
+    print("智能诊断：%s（%s）" % (result.get("endpoint", ""), result.get("checked_at", "")))
+    for f in result.get("findings", []):
+        print("  %s %s：%s" % (icons.get(f["level"], "[ ? ]"), f["name"], f["evidence"]))
+        if f["level"] != "ok":
+            print("         处理：%s" % f["advice"])
+    print("结论：%s" % result.get("overall", ""))
+    if result.get("actions"):
+        print("处理清单（按可能性排序）：")
+        for i, a in enumerate(result["actions"], 1):
+            print("  %d. %s" % (i, a))
+
+
+def run_diagnose(cfg, duration_sec=6, do_send_test=False):
+    """CLI/GUI 共用：先跑一次传输检测，再喂给 diagnose 打印报告。异常返回 1，否则 0。"""
+    _force_utf8_stdout()
+    ep = _local_endpoint((cfg or {}).get("endpoint") or DEFAULT_CONFIG["endpoint"])
+    base = (cfg or {}).get("_base_dir") or program_dir()
+    cd = (cfg or {}).get("cert_dir") or "certs"
+    cert_dir = cd if os.path.isabs(cd) else os.path.join(base, cd)
+    tx = asyncio.run(transmission_check_async(
+        ep, namespace_uri=(cfg or {}).get("namespace_uri") or "urn:chromextract:opcua",
+        security=(cfg or {}).get("security", "none"), cert_dir=cert_dir,
+        duration_sec=duration_sec, do_send_test=do_send_test))
+    _print_transmission_result(tx)
+    result = diagnose(cfg, transmission_result=tx)
+    _print_diagnosis_result(result)
+    return 1 if result.get("overall") == "异常" else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1107,6 +2163,88 @@ def run_gui(cfg):
             web["srv"] = ws
             webbrowser.open(ws.url())
     tk.Button(bar, text="打开设置页面…", command=open_web).pack(side="right", padx=4)
+
+    def _gui_transmission(send):
+        # 后台线程连本机服务做检测/发送，结果写日志窗，不阻塞界面
+        def work():
+            try:
+                ep = _local_endpoint(cfg["endpoint"])
+                base = cfg.get("_base_dir") or program_dir()
+                cd = cfg.get("cert_dir") or "certs"
+                cert_dir = cd if os.path.isabs(cd) else os.path.join(base, cd)
+                get_log().info("开始%s（%s）…", "发送测试数据并检测" if send else "数据传输检测", ep)
+                result = asyncio.run(transmission_check_async(
+                    ep, namespace_uri=cfg.get("namespace_uri") or "urn:chromextract:opcua",
+                    security=cfg.get("security", "none"), cert_dir=cert_dir,
+                    duration_sec=6, do_send_test=bool(send)))
+                for s in result.get("steps", []):
+                    get_log().info("%s %s：%s", "[ 通过 ]" if s["ok"] else "[ 失败 ]",
+                                   s["name"], s["detail"])
+                get_log().info("数据传输检测%s", "通过：数据传输正常" if result.get("ok")
+                               else "未通过，见上面失败步骤")
+            except Exception as e:  # noqa
+                get_log().error("数据传输检测出错：%s", e)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _gui_diagnose():
+        # 后台线程：先跑传输检测，再做五层诊断，结果进日志窗，不阻塞界面
+        def work():
+            try:
+                ep = _local_endpoint(cfg["endpoint"])
+                base = cfg.get("_base_dir") or program_dir()
+                cd = cfg.get("cert_dir") or "certs"
+                cert_dir = cd if os.path.isabs(cd) else os.path.join(base, cd)
+                get_log().info("开始智能诊断（%s）…", ep)
+                tx = asyncio.run(transmission_check_async(
+                    ep, namespace_uri=cfg.get("namespace_uri") or "urn:chromextract:opcua",
+                    security=cfg.get("security", "none"), cert_dir=cert_dir,
+                    duration_sec=6, do_send_test=False))
+                for s in tx.get("steps", []):
+                    get_log().info("%s %s：%s", "[ 通过 ]" if s["ok"] else "[ 失败 ]",
+                                   s["name"], s["detail"])
+                result = diagnose(cfg, transmission_result=tx)
+                icons = {"ok": "[ 通过 ]", "warn": "[ 注意 ]", "fail": "[ 失败 ]"}
+                for f in result.get("findings", []):
+                    get_log().info("%s %s：%s", icons.get(f["level"], "[ ? ]"),
+                                   f["name"], f["evidence"])
+                    if f["level"] != "ok":
+                        get_log().info("处理：%s", f["advice"])
+                get_log().info("智能诊断结论：%s", result.get("overall", ""))
+                for i, a in enumerate(result.get("actions", []), 1):
+                    get_log().info("处理清单 %d. %s", i, a)
+            except Exception as e:  # noqa
+                get_log().error("智能诊断出错：%s", e)
+        threading.Thread(target=work, daemon=True).start()
+
+    tk.Button(bar, text="智能诊断",
+              command=_gui_diagnose).pack(side="right", padx=4)
+    tk.Button(bar, text="发送测试数据",
+              command=lambda: _gui_transmission(True)).pack(side="right", padx=4)
+    tk.Button(bar, text="数据传输检测",
+              command=lambda: _gui_transmission(False)).pack(side="right", padx=4)
+
+    def _gui_rtu485():
+        # 后台线程做 485 配型诊断（只读），结果进日志窗
+        from tkinter import simpledialog
+        port = simpledialog.askstring("485配型诊断", "串口（例如 COM3）：", parent=root)
+        if not port:
+            return
+        def work():
+            try:
+                import nettest
+                get_log().info("开始 485 配型诊断（%s，自动试参数，只读）…", port)
+                r = nettest.diagnose_rtu485(
+                    port.strip(), progress=lambda s: get_log().info("%s", s))
+                get_log().info("%s %s", "[ 通过 ]" if r["ok"] else "[ 失败 ]", r["summary"])
+                for line in r["details"]:
+                    for sub in str(line).split("\n"):
+                        get_log().info("%s", sub)
+            except Exception as e:  # noqa
+                get_log().error("485 配型诊断出错：%s", e)
+        threading.Thread(target=work, daemon=True).start()
+
+    tk.Button(bar, text="485配型诊断",
+              command=_gui_rtu485).pack(side="right", padx=4)
     box = scrolledtext.ScrolledText(root, state="disabled")
     box.pack(fill="both", expand=True, padx=10, pady=6)
 
@@ -1309,6 +2447,25 @@ def _selftest_web(tmp):
         return True, "设置页面（HTTPS）正常"
     finally:
         srv.stop()
+
+
+def run_rtu485_cli(args):
+    """--diagnose-485：自动试参数 + 数据配型，打印结论。只读，不写寄存器。"""
+    import nettest
+    try:
+        r = nettest.diagnose_rtu485(
+            args.diagnose_485, unit=args.slave, func=args.function, addr=args.register,
+            count=args.count, baud=args.baud, timeout=max(0.05, args.timeout_ms / 1000.0),
+            scan_slaves=args.scan_slaves,
+            progress=lambda s: print("    " + s))
+    except nettest.TestError as e:
+        print("[ 失败 ] " + str(e))
+        return 1
+    print(("[ 成功 ] " if r["ok"] else "[ 失败 ] ") + r["summary"])
+    for line in r["details"]:
+        for sub in str(line).split("\n"):
+            print("    " + sub)
+    return 0 if r["ok"] else 1
 
 
 def run_nettest_cli(argv):
@@ -1555,7 +2712,9 @@ def normalize_config(cfg, base_dir):
                         ("log_backups", 0, 20), ("max_trace_points", 1000, 5000000),
                         ("max_file_mb", 1, 2048), ("web_port", 1, 65535),
                         ("alert_stale_minutes", 0, 100000), ("alert_scan_errors", 0, 1000),
-                        ("smtp_port", 1, 65535), ("env_check_hours", 0, 168)):
+                        ("smtp_port", 1, 65535), ("env_check_hours", 0, 168),
+                        ("test_send_min_interval_sec", 0, 3600),
+                        ("transmission_stale_sec", 60, 604800)):
         _clamp_int(cfg, key, lo, hi)
     dirs = cfg.get("watch_dirs") or []
     if isinstance(dirs, str):
@@ -1575,6 +2734,7 @@ def normalize_config(cfg, base_dir):
     cfg["users"] = users
     if not cfg.get("allow_anonymous", True) and not users:
         raise ConfigError("allow_anonymous=false 但没有配置任何 users，将没有人能连接。")
+    cfg["allow_test_send"] = bool(cfg.get("allow_test_send", True))
     chrom_core.set_limits(max_points=cfg["max_trace_points"], max_file_mb=cfg["max_file_mb"])
     return cfg
 
@@ -1626,6 +2786,12 @@ def security_report(cfg):
     if cfg.get("remote_export", True):
         out.append(("注意", "允许远程调用 ExportCSV（已限流 %s 秒/次）。不需要可设 remote_export=false。"
                     % cfg.get("export_min_interval_sec")))
+    if cfg.get("allow_test_send", True):
+        out.append(("注意", "允许远程调用 SendTestData 发送测试数据（已限流 %s 秒/次，仅写 Station_TEST "
+                            "测试通道，不改真实数据）。不需要可设 allow_test_send=false。"
+                    % cfg.get("test_send_min_interval_sec")))
+    else:
+        out.append(("正常", "已禁止远程发送测试数据（allow_test_send=false）。"))
     return out
 
 
@@ -1793,6 +2959,27 @@ def main(argv=None):
     ap.add_argument("--hash-password", action="store_true",
                     help="生成登录密码的哈希（粘贴到 config.json 的 users 里）")
     ap.add_argument("--check-security", action="store_true", help="安全体检：检查当前配置的安全状况")
+    ap.add_argument("--check-transmission", nargs="?", const="", default=None, metavar="endpoint",
+                    help="数据传输检测：连接 OPC UA 服务并逐步验证读/订阅/回显（缺省用 config 的 endpoint）")
+    ap.add_argument("--send-test-data", action="store_true",
+                    help="配合 --check-transmission：检测时顺带调用 SendTestData 发送测试数据")
+    ap.add_argument("--check-seconds", type=float, default=6,
+                    help="数据传输检测的订阅时长（秒，默认 6）")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="智能诊断：自动跑一次传输检测，再做配置—服务—数据—传输—日志五层诊断")
+    ap.add_argument("--diagnose-485", metavar="串口", default=None,
+                    help="RS-485 数据配型自诊断：自动试串口参数读 Modbus RTU 寄存器，"
+                         "再试数据类型与字节序给出推荐配型，例如：--diagnose-485 COM3")
+    ap.add_argument("--slave", type=int, default=1, help="485 诊断的从站站号（默认 1）")
+    ap.add_argument("--scan-slaves", action="store_true",
+                    help="485 诊断时扫描站号 1-247（慢，有超时上限）")
+    ap.add_argument("--register", type=int, default=0, help="485 诊断的起始寄存器地址（默认 0）")
+    ap.add_argument("--count", type=int, default=4, help="485 诊断读的寄存器个数（默认 4）")
+    ap.add_argument("--function", type=int, default=3, choices=(3, 4),
+                    help="485 诊断功能码：3 保持寄存器 / 4 输入寄存器（只读）")
+    ap.add_argument("--baud", type=int, default=None, help="485 诊断指定波特率（不指定则自动试常用波特率）")
+    ap.add_argument("--timeout-ms", type=int, default=300, help="485 诊断单次应答超时毫秒（默认 300）")
+    ap.add_argument("--list-serial", action="store_true", help="列出本机串口")
     ap.add_argument("--admin", action="store_true", help="安全管理菜单（体检/一键加固/账号管理）")
     ap.add_argument("--harden", action="store_true", help="一键加固：开启加密、关闭匿名、创建登录账号")
     ap.add_argument("--add-user", metavar="用户名", help="添加账号或重设密码（会提示输入密码）")
@@ -1913,6 +3100,26 @@ def main(argv=None):
     if args.check_security:
         print_security_report(cfg)
         return 0
+
+    if args.check_transmission is not None:
+        ep = args.check_transmission or _local_endpoint(cfg["endpoint"])
+        return run_transmission_check(ep, cfg=cfg, duration_sec=args.check_seconds,
+                                      do_send_test=args.send_test_data)
+
+    if args.diagnose:
+        return run_diagnose(cfg, duration_sec=args.check_seconds,
+                            do_send_test=args.send_test_data)
+
+    if args.list_serial:
+        import nettest
+        r = nettest.list_serial_ports()
+        print(("[ 成功 ] " if r["ok"] else "[ 失败 ] ") + r["summary"])
+        for line in r["details"]:
+            print("    " + line)
+        return 0 if r["ok"] else 1
+
+    if args.diagnose_485:
+        return run_rtu485_cli(args)
 
     if args.list:
         chrom_core.list_sources(args.list)

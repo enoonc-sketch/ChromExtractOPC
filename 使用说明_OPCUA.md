@@ -77,6 +77,9 @@
 | `csv_export_dir` | `谱图导出` | CSV 导出的默认输出目录 |
 | `log_file` | `logs/server.log` | 日志文件 |
 | `max_points` | `20000` | 单条曲线发布到 OPC UA 的最大点数（超出自动等间隔抽点） |
+| `allow_test_send` | `true` | 是否允许远程调用 `SendTestData`（仅写 `Station_TEST` 测试通道；关掉后调用返回拒绝） |
+| `test_send_min_interval_sec` | `5` | 发送测试数据的最短间隔（秒），太频繁返回 `BadTooManyOperations` |
+| `transmission_stale_sec` | `7200` | 数据超过多少秒没更新视为"数据较旧"（`TransmissionStatus` 与智能诊断共用） |
 
 ## 4. OPC UA 地址空间（节点表）
 
@@ -86,7 +89,12 @@
 Chromatograph
 ├─ ServerVersion                 String   服务版本
 ├─ WatchDirs                     String   监控目录
+├─ Heartbeat                     Int64    心跳（每轮扫描 +1，判断服务是否卡死）
+├─ LastScanTime                  String   最近一轮扫描时间
+├─ Diagnostics                   只读诊断对象（v2.4 新增，见下表）
 ├─ ExportCSV()                   方法     远程触发 CSV 导出，返回输出文件夹路径
+├─ SendTestData()                方法     发送合成测试谱图到 Station_TEST，返回 [说明, 点数]
+├─ EchoTest(text)                方法     原样回显，返回 [回显, 服务端时间, 计数]
 └─ Station_<仪器序列号>
    ├─ Info
    │  ├─ SerialNumber            String   仪器序列号
@@ -118,6 +126,56 @@ Chromatograph
 **DCS / 上位机接入建议**：订阅 `LatestCycle.CycleTime`（或 `Status.Revision`）判断新周期，
 新周期到来时批量读取 `Trace.ValueArray`（时间对应用 `Trace.TimeArray`），并把
 `LatestCycle` 下的元数据一并入库。也可以直接对数组变量建订阅，按死区/周期刷新。
+
+`Diagnostics` 子节点（全部只读，远程用户不可改写）：
+
+| 节点 | 类型 | 说明 |
+|---|---|---|
+| `TestSignal` | Double | 测试信号 `sin(TestCounter)`，每轮扫描变化；无新谱图时订阅它也能证明传输活着 |
+| `TestCounter` | Int64 | 测试计数，每轮扫描 +1 |
+| `ChannelCount` / `GoodChannelCount` | Int32 | 真实通道总数 / 可信（Good）通道数（不含 Station_TEST） |
+| `TotalPoints` | Int64 | 本轮快照总点数 |
+| `LastDataChangeTime` / `DataAgeSeconds` | String / Double | 最近数据更新时间 / 数据年龄（秒） |
+| `TransmissionStatus` | String | 无数据 / 正常 / 数据较旧（阈值 `transmission_stale_sec`） |
+| `ServerStartTime` / `UptimeSeconds` | String / Double | 服务启动时间 / 已运行时长（秒） |
+| `DiagnosisLevel` / `DiagnosisSummary` / `LastDiagnosisTime` | String | 服务端轻量诊断摘要（正常/注意/异常 + 一句话说明 + 刷新时间） |
+
+## 4.1 数据传输检测与智能诊断（v2.4 新增）
+
+端口通不等于数据在传。v2.4 提供两级工具，都不需要改 DCS 配置：
+
+**数据传输检测**（逐步验证连接→读数→订阅→回显）：
+
+```
+ChromExtractOPC.exe --check-transmission
+ChromExtractOPC.exe --check-transmission --send-test-data --check-seconds 10
+python tools\opcua_test_client.py opc.tcp://127.0.0.1:4840/ChromExtract/ --transmission
+```
+
+- 缺省连 `config.json` 的 endpoint（`0.0.0.0` 自动换 `127.0.0.1`）；`--check-seconds`
+  控制订阅时长。订阅窗口内无变化多半是扫描间隔较长，报告会如实说明，不误判失败。
+- `--send-test-data` 会调用 `SendTestData` 把一条约 600 点合成谱图写到独立的
+  `Station_TEST` 测试通道并验证可读；真实通道数据与 Good 状态不受影响。
+  不需要时把 `allow_test_send` 设为 `false` 即可禁止远程发送。
+- GUI 里有「数据传输检测」「发送测试数据」按钮，结果显示在日志窗。
+
+**智能诊断**（纯规则、离线可用，不用大模型）：
+
+```
+ChromExtractOPC.exe --diagnose
+ChromExtractOPC.exe --diagnose --check-seconds 10
+```
+
+- 自动先跑一次传输检测，再收齐五层证据逐项判定：配置合法性、监控目录、
+  服务存活（心跳/LastScanTime，报告标注判断依据）、通道健康（Good/点数一致性）、
+  数据新鲜度、传输健康、近期日志错误计数；每项给证据数字和具体处理步骤，
+  最后给正常/注意/异常结论与按可能性排序的处理清单。结论为异常时退出码非 0。
+- GUI 里有「智能诊断」按钮（后台运行，结果进日志窗）；验收客户端
+  `--transmission` 跑完也会附带打印诊断结论（按本机 `config.json` 的目录/日志路径诊断，
+  请在部署目录里运行）。
+- 常见结论对照：监控目录失败多为 `watch_dirs` 路径不对（"装好了却没数据"）；
+  数据较旧但心跳正常多为色谱无新周期（不是故障）；通道 Good=False 为数据源丢失；
+  订阅无通知但读取正常多为发布间隔/网络抖动，可加大 `--check-seconds` 复测。
 
 ## 5. 安全模式（可选）
 
@@ -202,5 +260,25 @@ ChromExtractOPC.exe --gui                      :: 打开图形监控窗口
 - 登录成功、登录失败、被拒绝的客户端都会记在 `logs\server.log`。
 - 完整的检查结果见 **安全检查报告.md**。
 - 新增节点：`Heartbeat`（每轮扫描 +1）和 `LastScanTime`，用来判断服务是否还活着；数据源丢失时，对应通道的 `Status.Good` 会变成 `False`。
-- 运行自动测试：`python -m unittest discover -s tests`（约 1 分钟）。
+- v2.4 新增 `Diagnostics` 诊断节点与 `SendTestData`/`EchoTest` 方法，及 `--check-transmission` / `--diagnose` 命令（见 4.1 节）；远程用户仍最高只读，发送测试数据走方法调用、不开写权限。
+- 运行自动测试：`python -m unittest discover -s tests`（112 条，约 2 分钟）。
 - Python 版本要求是 **3.10 及以上**。
+
+
+## RS-485 数据配型自诊断（v2.5 新增）
+
+现场 485 设备读不出数、或读出的数不对时，用它自动找参数和数据类型：
+
+```
+ChromExtractOPC.exe --list-serial
+ChromExtractOPC.exe --diagnose-485 COM3
+ChromExtractOPC.exe --diagnose-485 COM3 --slave 7 --register 0 --count 4
+ChromExtractOPC.exe --diagnose-485 COM3 --scan-slaves
+```
+
+它会依次试常用波特率（9600/19200/38400/115200/4800/2400/57600）、校验（N/E/O）、
+停止位（1/2），用读寄存器请求（功能码 03/04，只读，绝不写设备）确认哪组参数通；
+通了以后连读两次，把整数、浮点和四种字节序（ABCD/CDAB/BADC/DCBA）全部解码，
+按数值是否像真实过程量、两次读数是否稳定打分，给出推荐配型和可直接粘贴的配置片段。
+图形界面里也有「485配型诊断」按钮。试完所有参数都没应答时会明确报未找到，
+并给出接线（A/B、终端电阻）、站号、波特率的排查步骤。

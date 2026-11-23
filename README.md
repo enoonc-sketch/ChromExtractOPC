@@ -314,6 +314,9 @@ ChromExtractOPC.exe --nettest modbus_tcp 192.168.1.20 502 unit=1 func=3 addr=0 c
 | `smtp_user` / `smtp_from` | 空 | 登录用户名 / 发件人（留空同用户名）；密码在设置页面里设置 |
 | `web_https` | `auto` | `auto` 对外开放时自动 HTTPS / `on` 始终 / `off` 不用 |
 | `web_cert_file` / `web_key_file` | 空 | 自有证书和私钥（PEM），留空自动生成 |
+| `allow_test_send` | `true` | 是否允许远程调用 `SendTestData` 发送测试数据（仅写 `Station_TEST` 测试通道） |
+| `test_send_min_interval_sec` | `5` | 发送测试数据的最短间隔（秒），防反复调用 |
+| `transmission_stale_sec` | `7200` | 数据超过多少秒没更新视为"数据较旧"（`Diagnostics.TransmissionStatus`） |
 
 ## OPC UA 地址空间
 
@@ -323,8 +326,15 @@ ChromExtractOPC.exe --nettest modbus_tcp 192.168.1.20 502 unit=1 func=3 addr=0 c
 Chromatograph
 ├─ ServerVersion                 String   服务版本
 ├─ WatchDirs                     String   监控目录
+├─ Heartbeat / LastScanTime      Int64/String  心跳（每轮扫描 +1）/ 最近扫描时间
+├─ Diagnostics/                  只读诊断：TestSignal、TestCounter、ChannelCount、
+│                                GoodChannelCount、TotalPoints、LastDataChangeTime、
+│                                DataAgeSeconds、TransmissionStatus、ServerStartTime、
+│                                UptimeSeconds、DiagnosisLevel、DiagnosisSummary、LastDiagnosisTime
 ├─ ExportCSV()                   方法     远程触发 CSV 导出，返回输出文件夹路径
 ├─ Alarms                      ActiveCount / Severity / Text / LastChange / NotifySilenced（异常告警）
+├─ SendTestData()                方法     发送合成测试谱图到 Station_TEST，返回 [说明, 点数]
+├─ EchoTest(text)                方法     原样回显，返回 [回显, 服务端时间, 计数]（证明双向传输）
 └─ Station_<仪器序列号>
    ├─ Info
    │  ├─ SerialNumber            String   仪器序列号
@@ -344,7 +354,18 @@ Chromatograph
 ChromExtractOPC.exe --extract 数据文件夹 -o 输出文件夹 --last 20
 ChromExtractOPC.exe --list 数据文件夹          :: 查看里面有什么
 ChromExtractOPC.exe --gui                      :: 打开图形监控窗口
+ChromExtractOPC.exe --check-transmission       :: 数据传输检测（连接/读/订阅/Echo 逐步验证）
+ChromExtractOPC.exe --check-transmission --send-test-data   :: 检测时顺带发送测试数据
+ChromExtractOPC.exe --diagnose                 :: 智能诊断（五层证据 + 处理清单，异常返回非 0）
 ```
+
+- **数据传输检测**证明数据真的在传（不止端口通）：建会话、读版本、订阅
+  `Diagnostics/TestSignal`+`Heartbeat`、读真实曲线并核对点数、`EchoTest` 往返；
+  GUI 里有「数据传输检测」「发送测试数据」按钮；验收客户端
+  `python tools\opcua_test_client.py <endpoint> --transmission` 同逻辑。
+- **智能诊断**（纯规则、离线可用）：一键收齐配置—服务—数据—传输—日志五层证据，
+  逐项给通过/注意/失败与具体处理步骤，结论分正常/注意/异常；GUI 里有「智能诊断」
+  按钮，`Diagnostics/DiagnosisLevel` 等节点是服务端轻量摘要（完整诊断跑 `--diagnose`）。
 
 - `--extract` 导出结果：`index.csv`（总清单）+ `csv\`（每条谱图一个 CSV：
   时间、原始计数、微伏、显示值）。
@@ -427,3 +448,11 @@ ChromExtractOPC.exe --gui                      :: 打开图形监控窗口
   - 后台静默运行（`bgrun.py`）：`--background` 无窗口运行、日志只写文件；单实例互斥；`--status` / `--stop` 正常停止；开机自启任务改为后台模式、低优先级；新增 `后台启动.bat`、`停止后台服务.bat`。
   - 注册为真正的 Windows 服务（`winservice.py`，纯 ctypes，无新依赖）：services.msc 可启停、延迟自动启动、崩溃自动重启、关机时正常停止；安装程序和 `安装.bat` 可选服务或计划任务；CI 增加服务注册、启停、卸载测试。
   - 打包：本地 `build_exe.bat` 和 GitHub Actions 都会先跑测试再打包，打包后自检（OPC UA + HTTPS 设置页面），生成 `ChromExtractOPC.exe.sha256` 校验文件。
+- v2.5（在 v2.4 网页版基础上合并数据传输检测与发送 + 智能诊断）：
+  - 新增只读 `Diagnostics` 诊断节点（测试信号/计数、通道计数、数据年龄、传输状态、运行时长、诊断摘要），每轮扫描更新；无新谱图时订阅 `TestSignal` 也能证明传输活着。
+  - 新增方法 `SendTestData`（合成谱图只写 `Station_TEST` 测试通道，受 `allow_test_send` 开关与限流控制，不改真实数据、不开写权限）与 `EchoTest`（双向回显）。
+  - 新增 `--check-transmission [--send-test-data] [--check-seconds N]` 客户端检测与 GUI「数据传输检测 / 发送测试数据」按钮；`tools/opcua_test_client.py --transmission` 同逻辑。
+  - 新增智能诊断 `--diagnose` 与 GUI「智能诊断」按钮：纯规则五层诊断（配置/目录/存活/通道/新鲜度/传输/日志），逐项给证据数字与可执行处理步骤；`Diagnostics` 新增 `DiagnosisLevel/DiagnosisSummary/LastDiagnosisTime` 轻量摘要。
+  - 新增配置 `allow_test_send`、`test_send_min_interval_sec`、`transmission_stale_sec`（均支持热加载）。
+  - 新增 RS-485 数据配型自诊断（`nettest.diagnose_rtu485`）：自动试波特率/校验/停止位/站号，只读 Modbus RTU 寄存器（功能码 03/04，绝不写），把 int16/uint16/int32/uint32/float32/float64 × 字节序 ABCD/CDAB/BADC/DCBA 全部解码打分，连读两次看稳定性，输出推荐配型与可粘贴配置片段。入口：`--diagnose-485 COM3 [--slave N] [--scan-slaves] [--register 地址] [--count 个数] [--function 3|4] [--baud 波特率] [--timeout-ms 毫秒]`、`--list-serial`、GUI「485配型诊断」按钮。无设备时明确报未找到并给排查步骤。
+  - 测试扩充到 230 条（线上 197 + 传输/诊断 23 + 485 配型 10）。

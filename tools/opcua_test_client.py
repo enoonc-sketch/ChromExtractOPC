@@ -5,8 +5,12 @@ opcua_test_client.py —— OPC UA 验收测试客户端
 
 用法：
   python opcua_test_client.py [endpoint] [--sec none|sign|sign_encrypt] [--cert 目录]
+  python opcua_test_client.py [endpoint] --transmission [--send-test-data] [--check-seconds N]
 
-连接后浏览 Chromatograph 节点，读取每个检测器通道的元数据和曲线摘要。
+默认：连接后浏览 Chromatograph 节点，读取每个检测器通道的元数据和曲线摘要。
+--transmission：数据传输检测（与 server_app.py --check-transmission 同一逻辑），
+逐步验证连接/读数/订阅/EchoTest，可选发送测试数据；通过返回 0，失败返回 1。
+检测后附带打印智能诊断结论（五层证据 + 处理清单，逻辑同 server_app.py --diagnose）。
 """
 import asyncio
 import os
@@ -38,6 +42,32 @@ async def main():
         sec = args[args.index("--sec") + 1]
     if "--cert" in args:
         cert_dir = args[args.index("--cert") + 1]
+
+    if "--transmission" in args:
+        import server_app
+        duration = 6.0
+        if "--check-seconds" in args:
+            try:
+                duration = float(args[args.index("--check-seconds") + 1])
+            except (ValueError, IndexError):
+                pass
+        result = await server_app.transmission_check_async(
+            endpoint, security=sec, cert_dir=cert_dir, duration_sec=duration,
+            do_send_test=("--send-test-data" in args))
+        server_app._print_transmission_result(result)
+        # 附带智能诊断结论：diagnose 是同步函数（含一次 OPC 采集），放线程里跑避免嵌套事件循环
+        try:
+            base = server_app.program_dir()
+            cfg = server_app.load_config(os.path.join(base, "config.json"))
+            cfg["_base_dir"] = base
+            cfg["_cfg_path"] = os.path.join(base, "config.json")
+            cfg["endpoint"] = endpoint
+            cfg["security"] = sec
+            diag = await asyncio.to_thread(server_app.diagnose, cfg, result)
+            server_app._print_diagnosis_result(diag)
+        except Exception as e:  # noqa
+            print("智能诊断未能完成：%s: %s" % (type(e).__name__, e))
+        raise SystemExit(0 if result.get("ok") else 1)
 
     from asyncua import Client, ua
     client = Client(url=endpoint)
