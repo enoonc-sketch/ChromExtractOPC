@@ -99,7 +99,9 @@ const
   FwRule = 'ChromExtractOPC-4840';
 
 var
-  DataPage: TInputDirWizardPage;
+  { 用 InputQuery 而非 InputDir：InputDir 页内置校验不许留空（静默安装必失败），
+    数据文件夹允许留空稍后设置，故用普通文本框，路径存在性由 NextButtonClick 查 }
+  DataPage: TInputQueryWizardPage;
   FwPage: TInputQueryWizardPage;
   SelftestFailed: Boolean;
 
@@ -156,11 +158,11 @@ end;
 
 procedure InitializeWizard();
 begin
-  DataPage := CreateInputDirPage(wpSelectTasks, '色谱数据所在文件夹',
+  DataPage := CreateInputQueryPage(wpSelectTasks, '色谱数据所在文件夹',
     '存放 *_V3.db 或 .mbd 文件的文件夹',
     '服务会监控这个文件夹里的谱图数据并通过 OPC UA 发布。' + #13#10 +
-    '留空 = 稍后在设置页面里再选。升级安装时留空会保留原来的设置。', False, '');
-  DataPage.Add('数据文件夹：');
+    '留空 = 稍后在设置页面里再选。升级安装时留空会保留原来的设置。');
+  DataPage.Add('数据文件夹：', False);
   DataPage.Values[0] := '';
 
   FwPage := CreateInputQueryPage(DataPage.ID, '防火墙',
