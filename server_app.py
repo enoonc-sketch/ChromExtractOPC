@@ -2451,6 +2451,7 @@ def _selftest_web(tmp):
 
 def run_rtu485_cli(args):
     """--diagnose-485：自动试参数 + 数据配型，打印结论。只读，不写寄存器。"""
+    _force_utf8_stdout()
     import nettest
     try:
         r = nettest.diagnose_rtu485(
@@ -2595,6 +2596,7 @@ def run_stability_multi_cli(argv):
 def run_selftest():
     """--selftest：在临时目录造演示数据，启动真实的 OPC UA 服务，用客户端读一遍。
     不碰 config.json，不占用 4840 端口。通过返回 0，失败返回 1。"""
+    _force_utf8_stdout()  # 测试可直接调用本函数（不经 main），cp1252 控制台也要能印中文
     import shutil
     import socket
     print("色谱提取 OPC UA 服务 v%s —— 自检开始（约需 10 秒）" % __version__)
