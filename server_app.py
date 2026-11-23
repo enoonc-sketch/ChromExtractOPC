@@ -61,11 +61,22 @@ __version__ = chrom_core.__version__
 
 def _force_utf8_stdout():
     """Windows 控制台默认编码（如 cp1252）写不下中文会直接崩溃；
-    程序输出大量中文，启动时就把 stdout/stderr 强制切到 UTF-8。"""
-    for stream in (sys.stdout, sys.stderr):
+    程序输出大量中文，启动时就把 stdout/stderr 强制切到 UTF-8。
+    reconfigure 失败时（如流被替换/分离过）用底层 buffer 重新包一层，
+    保证后续 print 中文不崩（CI 上 test_selftest_passes 曾因此失败）。"""
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        if stream is None:
+            continue
         try:
-            if stream is not None:
-                stream.reconfigure(encoding="utf-8", errors="replace")
+            stream.reconfigure(encoding="utf-8", errors="replace")
+            continue
+        except Exception:
+            pass
+        try:
+            import io
+            setattr(sys, name, io.TextIOWrapper(
+                stream.buffer, encoding="utf-8", errors="replace", line_buffering=True))
         except Exception:
             pass
 
@@ -2553,6 +2564,7 @@ def run_selftest():
         ok, msg = False, "%s: %s" % (type(e).__name__, e)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    _force_utf8_stdout()  # 自检期间流可能被其它代码动过，打印结论前再强制一次
     print(("[ 通过 ] " if ok else "[ 失败 ] ") + msg)
     if ok:
         print("程序本身工作正常。如果现场仍读不到数据，问题在 config.json 的监控目录或网络/防火墙。")
