@@ -192,11 +192,11 @@ class EntryPoints(unittest.TestCase):
         self.assertIn("--desktop", text)
         self.assertIn("--settings", text)
 
-    def test_version_is_31(self):
+    def test_version_is_33(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
             sa.main(["--version"])
-        self.assertIn("3.1", buf.getvalue())
+        self.assertIn("3.3", buf.getvalue())
 
     def test_help_lists_modbus_tools(self):
         buf = io.StringIO()
@@ -208,12 +208,15 @@ class EntryPoints(unittest.TestCase):
 
 
 class WindowSmoke(unittest.TestCase):
+    """真实 tkinter 窗口冒烟（没有显示环境时跳过）：v3.2 左侧导航 + 懒加载页面。"""
+
     def test_window_constructs_and_closes(self):
+        import ui_layout
         tmp = tempfile.mkdtemp()
         try:
             cfg_path = os.path.join(tmp, "config.json")
             with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump({"poll_seconds": 30, "desktop_language": "zh"}, f)
+                json.dump({"poll_seconds": 30, "desktop_language": "zh", "desktop_auth": False}, f)
             cfg = sa.load_config(cfg_path)
             cfg["_cfg_path"], cfg["_base_dir"] = cfg_path, tmp
             sa.normalize_config(cfg, tmp)
@@ -223,38 +226,50 @@ class WindowSmoke(unittest.TestCase):
                 self.skipTest("无显示环境，跳过窗口冒烟：%s" % e)
             win.root.update_idletasks()
             win.root.update()
-            tabs = [win.nb.tab(i, "text") for i in range(win.nb.index("end"))]
-            self.assertEqual(tabs, ["运行状态", "通道数据", "谱图预览", "历史对比", "客户端连接", "数据与导出", "运行报表",
-                                    "告警与通知", "诊断工具", "通讯诊断", "Modbus 转发", "常用设置", "系统设置",
-                                    "备份与审计"])
-            # v3.1：峰表、历史对比、Modbus 转发、运行报表、备份与审计、登录栏
+            # 打开时只建了总览页（懒加载）
+            self.assertEqual(win.pages.current, "overview")
+            self.assertEqual(win.pages.built, {"overview"})
+            self.assertEqual([p.pid for p in ui_layout.pages()], list(win._nav_items))
+            # 逐页打开：每页只建一次
+            for pid in ui_layout.page_ids():
+                win._show_page(pid)
+                win.root.update()
+                self.assertEqual(win.pages.current, pid)
+                self.assertNotIn(pid, win.pages.errors, pid)
+            for pid in ui_layout.page_ids():
+                win._show_page(pid)
+            self.assertTrue(all(n == 1 for n in win.pages.build_count.values()))
+            # v3.1 / v3.0 / v2.9 / v2.8 的控件都还在（分散到新页面里）
             for attr in ("pk_tree", "hs_tree", "hs_canvas", "mb_tree", "rp_out", "bk_preview", "au_tree", "ur_tree",
-                         "user_var", "btn_login", "lang_combo"):
-                self.assertTrue(hasattr(win, attr), attr)
-            self.assertFalse(win.session.can("config"))      # 没登录 = 操作员只读
-            win._set_language("en")
-            self.assertEqual(win.nb.tab(0, "text"), "Service status")
-            self.assertEqual(win.btn_start.cget("text"), "▶ Start service")
-            win._set_language("zh")
-            self.assertEqual(win.nb.tab(0, "text"), "运行状态")
-            # v3.0 通讯诊断：IP 扫描、端口扫描、串口诊断，各有进度条
-            for attr in ("ip_tree", "ps_tree", "sp_tree", "sp_out", "sp_iface", "sp_rts"):
+                         "user_var", "btn_login", "lang_combo", "tb_lang", "ip_tree", "ps_tree", "sp_tree", "sp_out",
+                         "sp_iface", "sp_rts", "chd_tree", "pv_canvas", "pv_combo", "pv_series", "cl_tree", "cl_sum",
+                         "qs_msg", "login_var", "btn_start", "btn_stop", "btn_restart", "data_dirs_var", "src_out",
+                         "exp_btn", "exp_dir", "exp_last", "box", "mbp_out", "mbp_poll_btn", "mbs_log", "mbs_area_out",
+                         "mbs_btn", "status_dot", "sb_vars", "crumb_var"):
                 self.assertTrue(hasattr(win, attr), attr)
             self.assertEqual(set(win.cs_prog), {"ip", "ps", "serial"})
-            # v3.0：通道表、谱图画布、客户端列表、常用设置表单、登录后自动打开窗口
-            for attr in ("chd_tree", "pv_canvas", "pv_combo", "pv_series", "cl_tree", "cl_sum", "qs_msg",
-                         "login_var", "tab_preview"):
-                self.assertTrue(hasattr(win, attr), attr)
             self.assertEqual(set(win._qvars), {f[0] for f in df.ALL_QUICK_FIELDS})
-            # v2.9：窗口里可启停服务、选数据目录、查看数据源、导出 CSV、自检、开网页
-            for attr in ("btn_start", "btn_stop", "btn_restart", "btn_selftest", "data_dirs_var",
-                         "src_out", "exp_btn", "exp_dir", "exp_last", "box"):
-                self.assertTrue(hasattr(win, attr), attr)
             self.assertFalse(win.svc.running())          # --settings：不自动启动服务
-            # v2.8：诊断工具页有 Modbus Poll / Slave 两个区域
-            for attr in ("mbp_out", "mbp_poll_btn", "mbs_log", "mbs_area_out", "mbs_btn"):
-                self.assertTrue(hasattr(win, attr), attr)
+            win._set_language("en")
+            self.assertEqual(win._nav_items["overview"].cget("text"), "Overview")
+            self.assertEqual(win.btn_start.cget("text"), "▶ Start service")
+            win._set_language("zh")
+            self.assertEqual(win._nav_items["overview"].cget("text"), "总览")
+            # v3.3：主题即时切换（深色 → 浅色），已建页面的经典控件颜色随之改变
+            import theme
+            win._set_theme("dark")
+            win.root.update()
+            self.assertEqual(str(win.root.cget("bg")).lower(), theme.PALETTES["dark"]["bg"])
+            self.assertEqual(str(win.box.cget("bg")).lower(), theme.PALETTES["dark"]["input_bg"])
+            win._set_theme("light")
+            win.root.update()
+            self.assertEqual(str(win.root.cget("bg")).lower(), theme.PALETTES["light"]["bg"])
+            self.assertEqual(str(win.nav.cget("bg")).lower(), theme.PALETTES["light"]["nav_bg"])
+            win._set_theme("auto")
+            win._show_page("history")
             win._on_close()
+            with open(cfg_path, encoding="utf-8") as f:
+                self.assertEqual(json.load(f).get("desktop_last_page"), "history")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

@@ -167,13 +167,19 @@ DEFAULT_CONFIG = {
     "desktop_auth": True,             # 关闭后窗口不需要登录，所有操作都可用（不推荐）
     "desktop_idle_lock_minutes": 15,  # 空闲多少分钟自动锁定（退回只读），0 = 不锁定
     "user_roles": {},
+    # ---- v3.2 新增：桌面窗口布局记忆（只影响本机窗口）----
+    "desktop_last_page": "overview",   # 上次打开的页面（ui_layout 的页面标识）；无效时回退“总览”
+    "desktop_geometry": "",            # 上次的窗口大小和位置（Tk 的 宽x高+X+Y）；空 = 默认 1100x720
+    # ---- v3.3 新增：桌面窗口主题（只影响本机窗口外观）----
+    "desktop_theme": "auto",           # light 浅色 / dark 深色 / auto 跟随 Windows 应用模式；无效时回退 auto
 }
 
 # 桌面窗口自己的设置项：保存后窗口立即使用，与服务的热加载/重启无关
 DESKTOP_KEYS = ("desktop_notify", "desktop_notify_level", "desktop_notify_quiet",
                 "desktop_auto_start_service", "desktop_start_minimized",
                 "desktop_language", "desktop_report_auto", "desktop_report_shifts", "desktop_report_dir",
-                "desktop_auth", "desktop_idle_lock_minutes")
+                "desktop_auth", "desktop_idle_lock_minutes",
+                "desktop_last_page", "desktop_geometry", "desktop_theme")
 DESKTOP_BOOL_KEYS = ("desktop_notify", "desktop_notify_quiet", "desktop_auto_start_service",
                      "desktop_start_minimized", "desktop_auth")
 
@@ -2886,6 +2892,8 @@ def normalize_config(cfg, base_dir):
         raise ConfigError("desktop_notify_level 只能是 all / critical，当前为：%r" % lv)
     cfg["desktop_notify_level"] = lv
     _normalize_v31(cfg)
+    _normalize_v32(cfg)
+    _normalize_v33(cfg)
     chrom_core.set_limits(max_points=cfg["max_trace_points"], max_file_mb=cfg["max_file_mb"])
     return cfg
 
@@ -2898,6 +2906,19 @@ def _clamp_float(cfg, key, lo, hi):
     if v != v or v in (float("inf"), float("-inf")):
         raise ConfigError("配置项 %s 不能是无穷大或 NaN" % key)
     cfg[key] = max(lo, min(hi, v))
+
+
+def _normalize_v32(cfg):
+    """v3.2 新配置项：窗口布局记忆。只是界面记忆，不合法时静默回退默认值（不让服务因此启动失败）。"""
+    import ui_layout
+    cfg["desktop_last_page"] = ui_layout.normalize_last_page(cfg.get("desktop_last_page"))
+    cfg["desktop_geometry"] = ui_layout.normalize_geometry(cfg.get("desktop_geometry"))
+
+
+def _normalize_v33(cfg):
+    """v3.3 新配置项：界面主题。只影响外观，不合法时静默回退 auto（不让服务因此启动失败）。"""
+    import theme
+    cfg["desktop_theme"] = theme.normalize_theme(cfg.get("desktop_theme", theme.DEFAULT_THEME))
 
 
 def _normalize_v31(cfg):
@@ -3447,7 +3468,7 @@ def run_restore_cli(path, base_dir, cfg_path, with_logs=False, yes=False, passwo
         return 2
     print("已还原 %d 个文件。还原前的配置已自动备份到：%s" % (len(r["written"]), r["auto_backup"] or "（无）"))
     if r["smtp_cleared"]:
-        print("SMTP 密码来自另一台电脑，已清空：请在窗口“告警与通知”里重新填写。")
+        print("SMTP 密码来自另一台电脑，已清空：请在窗口“监控 › 告警 → 通知设置”里重新填写。")
     print("请重启服务（在桌面窗口点“重启服务”，或关闭后重新打开程序）让证书和端口等设置生效。")
     return 0
 

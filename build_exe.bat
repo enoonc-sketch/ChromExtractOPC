@@ -61,6 +61,8 @@ build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --windowed
   --hidden-import modbus_server ^
   --hidden-import reports ^
   --hidden-import audit ^
+  --hidden-import ui_layout ^
+  --hidden-import theme ^
   --hidden-import config_tools ^
   --hidden-import alerts ^
   --hidden-import nettest ^
@@ -91,6 +93,8 @@ build_env\Scripts\python -m PyInstaller --noconfirm --onefile --console --noupx 
   --hidden-import modbus_server ^
   --hidden-import reports ^
   --hidden-import audit ^
+  --hidden-import ui_layout ^
+  --hidden-import theme ^
   --hidden-import config_tools ^
   --hidden-import alerts ^
   --hidden-import nettest ^

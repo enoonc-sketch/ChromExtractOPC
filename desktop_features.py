@@ -322,7 +322,7 @@ class RecordSource:
                 return list(recs), "service", note
         dirs = [d for d in (dirs or []) if d]
         if not dirs:
-            return [], "none", tr("服务未运行，也还没有设置数据目录（“数据与导出”页里选择）")
+            return [], "none", tr("服务未运行，也还没有设置数据目录（“数据 › 导出 CSV / 数据源”页里选择）")
         key = (tuple(dirs), int(last_n), int(max_points))
         now = self.clock()
         if (not force and self._dir_recs is not None and key == self._dir_key
@@ -463,7 +463,7 @@ def endpoint_port(endpoint):
 def endpoint_with_port(endpoint, port):
     m = _EP_RE.match(str(endpoint or "").strip())
     if not m:
-        raise QuickSettingError(tr("当前 endpoint 格式不对（%r），请在“系统设置”里直接改 endpoint。") % endpoint)
+        raise QuickSettingError(tr("当前 endpoint 格式不对（%r），请在“系统 › 常用设置 → OPC UA 服务”里直接改 endpoint。") % endpoint)
     return "%s%s:%d%s" % (m.group(1), m.group(2) or "0.0.0.0", int(port), m.group(4) or "")
 
 
@@ -565,7 +565,7 @@ def save_message(changed, sa):
     if hot:
         lines.append(tr("自动生效（服务运行中，下一轮扫描内自动加载）：%s。") % _labels(hot))
     if restart:
-        extra = tr("（桌面“数据与导出”页立即使用新目录）") if "csv_export_dir" in restart else ""
+        extra = tr("（桌面“数据 › 导出 CSV / 数据源”页立即使用新目录）") if "csv_export_dir" in restart else ""
         lines.append(tr("需要重启服务才生效：%s%s。可点“保存并重启服务”或窗口上方“重启服务”。") % (_labels(restart), extra))
     if desk:
         lines.append(tr("桌面窗口设置，已立即生效：%s。") % _labels(desk))
@@ -752,7 +752,7 @@ def notification_text(alerts, app_name=None):
     title = tr("%s：新告警 %d 项%s") % (app_name, len(alerts), tr("（严重 %d）") % len(crit) if crit else "")
     body = "\n".join("[%s] %s" % (a.get("level"), a.get("text")) for a in alerts[:3])
     if len(alerts) > 3:
-        body += tr("\n……另有 %d 项，请看窗口“运行状态”页") % (len(alerts) - 3)
+        body += tr("\n……另有 %d 项，请看窗口“监控 › 告警”页") % (len(alerts) - 3)
     if len(body) > 250:
         body = body[:247] + "…"
     return title[:63], body, ("error" if crit else "warning")

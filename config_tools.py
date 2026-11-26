@@ -231,6 +231,10 @@ EDITABLE = {
     "modbus_server_allow": list, "modbus_server_unit": int, "modbus_server_order": str,
     "desktop_report_auto": str, "desktop_report_dir": str,
     "desktop_auth": bool, "desktop_idle_lock_minutes": int,
+    # v3.2 窗口布局记忆
+    "desktop_last_page": str, "desktop_geometry": str,
+    # v3.3 界面主题
+    "desktop_theme": str,
 }
 
 # 结构化的配置项（列表 / 字典）：不走表单，用 set_value() 整体替换并校验

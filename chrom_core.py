@@ -17,7 +17,7 @@ import struct
 import sys
 import tempfile
 
-__version__ = "3.1"
+__version__ = "3.3"
 
 # ---- 输入防护上限：数据文件来自外部，不能假设它是善意、完整的 ----
 MAX_TRACE_POINTS = 2_000_000          # 单条谱图最多采样点数

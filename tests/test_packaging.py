@@ -148,7 +148,11 @@ HIDDEN_IMPORTS = ("web_settings", "demo_data", "config_tools", "alerts", "nettes
                   "drivercheck", "envwatch", "instance_lock", "modbus_tools", "desktop_ui", "desktop_features",
                   "commscan", "tkinter",
                   # v3.1
-                  "i18n", "backup_tools", "history", "peaks", "modbus_server", "reports", "audit")
+                  "i18n", "backup_tools", "history", "peaks", "modbus_server", "reports", "audit",
+                  # v3.2
+                  "ui_layout",
+                  # v3.3
+                  "theme")
 
 
 class ExeBuild(unittest.TestCase):
@@ -182,7 +186,7 @@ class ExeBuild(unittest.TestCase):
         found = set()
         for name in ("server_app.py", "desktop_ui.py", "web_settings.py", "desktop_features.py", "commscan.py",
                      "backup_tools.py", "history.py", "peaks.py", "modbus_server.py", "reports.py", "audit.py",
-                     "i18n.py"):
+                     "i18n.py", "ui_layout.py", "theme.py"):
             tree = ast.parse(self._t(name))
             for node in ast.walk(tree):
                 if isinstance(node, ast.Import):
@@ -196,7 +200,9 @@ class ExeBuild(unittest.TestCase):
 
 class V31Modules(unittest.TestCase):
     """v3.1 新模块：逻辑与 tkinter 解耦、不引入新的第三方依赖、两个 EXE 都打包进去。"""
-    NEW = ("i18n", "backup_tools", "history", "peaks", "modbus_server", "reports", "audit")
+    NEW = ("i18n", "backup_tools", "history", "peaks", "modbus_server", "reports", "audit",
+           "ui_layout",      # v3.2：导航结构也不依赖 tkinter
+           "theme")          # v3.3：主题（调色板 / 样式表 / 着色规则）也不依赖 tkinter
 
     def test_new_modules_do_not_import_tkinter(self):
         import ast

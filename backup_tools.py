@@ -542,7 +542,7 @@ def inspect_backup(path, base_dir, cfg_path, password=None, include_logs=False, 
     smtp_clear = cross and smtp.startswith("dpapi:")
     if smtp_clear:
         warnings.append(M("备份来自另一台电脑（%s）：SMTP 密码是那台电脑加密的，这里无法解密，还原后会清空，"
-                          "请在“告警与通知”里重新填写。", m.get("hostname") or "?"))
+                          "请在“监控 › 告警 → 通知设置”里重新填写。", m.get("hostname") or "?"))
     elif cross:
         warnings.append(M("备份来自另一台电脑（%s）。", m.get("hostname") or "?"))
     if any(a[1].startswith(("certs/", "trusted/")) and is_private_key(a[1], files.get(a[1], b"")) for a in actions):

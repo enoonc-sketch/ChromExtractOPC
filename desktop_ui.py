@@ -24,6 +24,22 @@ v3.0 新增（逻辑都在 desktop_features.py，可脱离 tkinter 测试；本�
     串口列表（驱动芯片 VID/PID）、RS232/485/422 接线提示、波特率自动探测、Modbus RTU 站号扫描、环回与原始收发；
     全部在工作线程运行，有进度条和停止按钮，结果可导出 CSV，只读探测不写寄存器。
 
+v3.2 界面整理（导航结构在不依赖 tkinter 的 ui_layout.py；本文件 V32Mixin 只负责画）：
+  - 14 个平铺标签页 → 左侧分组导航（监控 / 数据 / 通讯 / 系统，可折叠）+ 右侧内容区；v3.1 的多区域页面
+    拆成 _sec_* 区域方法，由 ui_layout.GROUPS 组合成新页面（内容多的用子标签）；新增“总览”仪表盘。
+  - 顶部工具栏（指示灯 + 启停、当前用户与角色、锁定、语言、网页设置）、底部状态栏、可折叠运行日志面板。
+  - 页面懒加载：PageManager 首次显示才建控件；渲染方法（ui_layout.RENDER_GUARDS）页面不可见时只记参数，
+    显示时补调；定时轮询只在相关页面可见时取数据（ui_layout.POLL_PAGES）。
+  - 无权限的导航项带锁灰显，点击提示所需角色；关闭窗口时记住页面和大小（desktop_last_page / desktop_geometry）。
+
+v3.3 现代主题（调色板、样式表、对比度、着色规则在不依赖 tkinter 的 theme.py；本文件 V33Mixin 只负责应用）：
+  - 不用第三方主题库，ttk.Style 以 'clam' 为底自定义；浅色 / 深色 / 跟随 Windows 系统（desktop_theme），
+    在“视图 → 主题”和“常用设置 → 界面语言与主题”里切换，即时生效。
+  - self.tk 是包装过的 tkinter：Button / Entry / Checkbutton / Radiobutton 换成 ttk 版本（主 / 次 / 危险三种按钮
+    样式按文字自动选），ttk.Treeview 自动斑马纹；经典控件（Label / Frame / Canvas / Text / Listbox）按“角色”
+    着色（theme.paint_tree），v3.2 写死的颜色自动对应到当前主题。
+  - 高 DPI：建窗口前声明 DPI 感知并设置 tk scaling，字体、行高、窗口默认 / 最小尺寸随缩放放大。
+
 设计：
   - 逻辑层 DesktopLogic 直接复用 web_settings.SettingsServer 的动作/状态方法
     （只构造对象、不启动 HTTP 服务）：保存仍走 config_tools.update_settings
@@ -46,6 +62,8 @@ import commscan
 import config_tools
 import desktop_features as df
 import i18n
+import theme
+import ui_layout
 import web_settings
 from i18n import M, tr, tr_msg, untr
 
@@ -375,7 +393,7 @@ class ServiceController:
             except Exception as e:  # noqa  最常见：端口被占用
                 self.error = str(e) or type(e).__name__
                 sa.get_log().error("OPC UA 服务未能运行：%s。如果是端口被占用，请关闭占用 %s 的程序，"
-                                   "或在“系统设置”里改 endpoint 端口后重新启动服务。", self.error, cfg.get("endpoint"))
+                                   "或在“系统 › 常用设置 → OPC UA 服务”里改 endpoint 端口后重新启动服务。", self.error, cfg.get("endpoint"))
             finally:
                 ready.set()
                 try:
@@ -540,6 +558,11 @@ def _scrollable(parent, tk, ttk):
     bar.pack(side="right", fill="y")
 
     def _wheel(e):
+        try:                      # v3.2：只滚动当前显示着的区域（隐藏页面 / 子标签里的不动）
+            if not canvas.winfo_ismapped():
+                return
+        except Exception:  # noqa
+            return
         canvas.yview_scroll(-1 if e.delta > 0 else 1, "units")
     canvas.bind_all("<MouseWheel>", _wheel, add="+")
     return inner
@@ -645,20 +668,25 @@ class V31Mixin:
         return widget
 
     # ---- 登录栏 ----
-    def _build_login_bar(self, root):
+    def _build_login_bar(self, parent):
+        """登录栏（v3.2 起放在顶部工具栏右侧）：当前用户与角色、登录、注销、锁定、创建管理员…"""
         tk = self.tk
-        bar = tk.Frame(root)
-        bar.pack(fill="x", padx=10, pady=(0, 2))
+        root = self.root
+        bar = tk.Frame(parent)
+        bar.pack(side="right", padx=(0, 8))
+        self.login_bar = bar
         self.user_var = tk.StringVar(value="")
         self.user_lbl = tk.Label(bar, textvariable=self.user_var, anchor="w", fg="#1f4e79")
         self.user_lbl.pack(side="left")
-        self.btn_login = tk.Button(bar, text=tr("登录"), command=self._login_dialog)
+        self.btn_login = tk.Button(bar, text=tr("登录"), command=self._login_dialog, style=theme.STYLE["primary"])
         self.btn_login.pack(side="left", padx=4)
-        self.btn_logout = tk.Button(bar, text=tr("注销"), command=self._logout)
+        self.btn_logout = tk.Button(bar, text=tr("注销"), command=self._logout, style=theme.STYLE["toolbar"])
         self.btn_logout.pack(side="left", padx=2)
-        self.btn_lock = tk.Button(bar, text=tr("锁定"), command=lambda: self._lock(tr("手动锁定")))
+        self.btn_lock = tk.Button(bar, text=tr("锁定"), command=lambda: self._lock(tr("手动锁定")),
+                                  style=theme.STYLE["toolbar"])
         self.btn_lock.pack(side="left", padx=2)
-        self.btn_admin = tk.Button(bar, text=tr("创建管理员…"), command=self._create_admin_dialog, fg="#cf222e")
+        self.btn_admin = tk.Button(bar, text=tr("创建管理员…"), command=self._create_admin_dialog,
+                                   style=theme.STYLE["primary"])
         self.btn_admin.pack(side="left", padx=8)
         for ev in ("<Any-KeyPress>", "<Any-ButtonPress>"):
             try:
@@ -671,21 +699,38 @@ class V31Mixin:
         import audit
         s = self.session
         if not s.auth_enabled:
-            text = tr("桌面登录已关闭：所有操作都可用（可在“备份与审计 → 账号与角色”开启）")
+            text = tr("桌面登录已关闭（全部可用）")
         elif s.user:
             text = tr("当前用户：%s（%s）") % (s.user, tr(audit.ROLE_NAMES.get(s.role, s.role)))
         else:
-            text = tr("未登录：操作员（只读）。修改配置、诊断、导出请先登录。")
-        self.user_var.set(text)
+            text = tr("未登录（操作员，只读）")
+        # v3.3：工具栏放不下时（900 像素宽、英文、还要显示“创建管理员…”）只显示简短身份，鼠标不用移开也能看懂
+        if not s.auth_enabled:
+            short = ""
+        elif s.user:
+            short = s.user
+        else:
+            short = tr("操作员")
+        self._user_text = (text, short)
+        self.user_var.set(short if getattr(self, "_tb_compact", False) else text)
         need_admin = s.auth_enabled and not audit.has_admin(config_tools.read_raw(self.cfg["_cfg_path"]))
-        try:
+        try:   # v3.2：工具栏空间有限，只显示当前可用的按钮
+            for b in (self.btn_login, self.btn_logout, self.btn_lock, self.btn_admin):
+                b.pack_forget()
+            if s.auth_enabled:
+                self.btn_login.pack(side="left", padx=(6, 2))
+            if s.user:
+                self.btn_logout.pack(side="left", padx=2)
+                self.btn_lock.pack(side="left", padx=2)
             if need_admin:
-                self.btn_admin.pack(side="left", padx=8)
-            else:
-                self.btn_admin.pack_forget()
+                self.btn_admin.pack(side="left", padx=(6, 0))
             self.btn_login.configure(state="normal" if s.auth_enabled else "disabled")
             self.btn_logout.configure(state="normal" if s.user else "disabled")
             self.btn_lock.configure(state="normal" if s.user else "disabled")
+        except Exception:  # noqa
+            pass
+        try:                               # 身份文字变长 / 多了按钮后，重新判断工具栏放不放得下
+            self.root.after_idle(self._toolbar_fit)
         except Exception:  # noqa
             pass
         self._apply_role()
@@ -700,6 +745,12 @@ class V31Mixin:
             self._set_service_buttons()
         except Exception:  # noqa
             pass
+        # v3.2：导航上的锁随角色变化；当前页面没有权限了（注销 / 锁定）就回到总览
+        pages = getattr(self, "pages", None)
+        if pages is not None and self._nav_items:
+            self._nav_refresh()
+            if pages.current and not ui_layout.allowed(pages.current, self.session.can):
+                self._show_page(ui_layout.DEFAULT_PAGE)
 
     def _do_login(self, name, password):
         import audit
@@ -769,15 +820,28 @@ class V31Mixin:
 
     # ---- 语言 ----
     def _build_menu(self, root):
+        """菜单栏（v3.2：文件 / 服务 / 工具 / 视图 来自 ui_layout.MENUS，外加 v3.1 的“语言 / Language”）。
+        切换语言时整条菜单栏重建一次。"""
         tk = self.tk
         try:
             menubar = tk.Menu(root)
+            for title, items in ui_layout.MENUS:
+                m = tk.Menu(menubar, tearoff=0)
+                for it in items:
+                    if it is None:
+                        m.add_separator()
+                        continue
+                    _key, text, meth = it
+                    m.add_command(label=tr(text), command=lambda n=meth: getattr(self, n)())
+                if title == "视图":                   # v3.3：视图 → 主题（浅色 / 深色 / 跟随系统）
+                    self._theme_menu(m)
+                menubar.add_cascade(label=tr(title), menu=m)
             lm = tk.Menu(menubar, tearoff=0)
             self.lang_menu_var = tk.StringVar(value=str(self.cfg.get("desktop_language", "auto")))
             for code, label in LANG_OPTIONS:
                 lm.add_radiobutton(label=label if code != "auto" else "跟随系统 / Auto", value=code,
                                    variable=self.lang_menu_var, command=lambda c=code: self._set_language(c))
-            menubar.add_cascade(label="语言 / Language", menu=lm)
+            menubar.add_cascade(label=ui_layout.LANG_MENU_TITLE, menu=lm)
             root.config(menu=menubar)
             self.menubar = menubar
         except Exception:  # noqa
@@ -785,7 +849,7 @@ class V31Mixin:
 
     def _build_lang_section(self, inner):
         tk, ttk = self.tk, self.ttk
-        sec = self._section(inner, tr("界面语言"))
+        sec = self._section(inner, tr("界面语言与主题"))      # v3.3：主题下拉框也放在这里
         row = tk.Frame(sec)
         row.pack(fill="x", pady=2)
         tk.Label(row, text=tr("界面语言"), width=26, anchor="w").pack(side="left")
@@ -799,6 +863,7 @@ class V31Mixin:
         tk.Label(sec, text=tr("切换后立即生效并保存（desktop_language）。日志内容和 OPC UA 节点名不翻译，"
                               "以免影响 DCS 组态；后台返回的个别诊断细节仍为中文。"),
                  fg="#777", anchor="w", justify="left", wraplength=860).pack(fill="x")
+        self._build_theme_row(sec)
 
     def _set_language(self, code):
         """切换界面语言：保存到配置，然后把窗口里所有已知文字换成新语言（即时刷新）。"""
@@ -810,14 +875,24 @@ class V31Mixin:
             self._audit("language", "desktop_language", None, {"desktop_language": code})
         except Exception as e:  # noqa
             self.sa.get_log().error("保存界面语言失败：%s", e)
+        codes = [c for c, _t in LANG_OPTIONS]
+        for w in ("tb_lang", "lang_combo"):          # v3.2：工具栏和常用设置页各有一个语言下拉框
+            try:
+                getattr(self, w).current(codes.index(code))
+            except Exception:  # noqa
+                pass
         try:
             self.lang_menu_var.set(code)
-            self.lang_combo.current([c for c, _t in LANG_OPTIONS].index(code))
         except Exception:  # noqa
             pass
         if old != new:
             n = self._retranslate(old, new)
             self._lang = new
+            self._build_menu(self.root)               # 菜单文字不在控件树里，整条重建
+            try:
+                self.lang_menu_var.set(code)
+            except Exception:  # noqa
+                pass
             self.sa.get_log().info("界面语言已切换为 %s（刷新 %d 处文字）", new, n)
         return new
 
@@ -832,6 +907,8 @@ class V31Mixin:
             nonlocal count
             try:
                 t = w.cget("text")
+                if t is not None and not isinstance(t, str) and type(t).__name__ == "Tcl_Obj":
+                    t = str(t)                     # v3.3：ttk 控件个别情况下返回 Tcl_Obj
             except Exception:  # noqa
                 t = None
             nt = fix(t) if isinstance(t, str) else None
@@ -899,7 +976,10 @@ class V31Mixin:
         # 动态内容重新生成一遍
         for fn in (self._render_user, self._set_service_buttons, self._render_channel_table,
                    lambda: self._pv_draw(force=True), self._reload, self._refresh_sec,
-                   self._pk_render, self._mb_render_map, self._mb_render_status):
+                   self._pk_render, self._mb_render_map, self._mb_render_status,
+                   # v3.2：导航、面包屑、状态栏、总览卡片、日志按钮
+                   self._nav_refresh, self._update_crumb, self._update_statusbar, self._render_overview,
+                   self._update_log_toggle, self._poll_service_text):
             try:
                 fn()
             except Exception:  # noqa
@@ -999,11 +1079,12 @@ class V31Mixin:
         def py(v):
             return y1 - (v - ymin) / (ymax - ymin) * (y1 - y0)
         n = 0
+        peak = self._pal["chart_peak"]          # v3.3：峰标注颜色跟随主题
         for p in self._pk_rows[:60]:
             ax, ay = px(p["rt"]), py(p["apex_y"])
-            c.create_line(px(p["start"]), py(p["start_y"]), px(p["end"]), py(p["end_y"]), fill="#d1242f", dash=(3, 2))
-            c.create_line(ax, ay - 2, ax, ay - 12, fill="#d1242f")
-            c.create_text(ax, ay - 14, text=str(p["no"]), anchor="s", font=("Microsoft YaHei", 8), fill="#d1242f")
+            c.create_line(px(p["start"]), py(p["start_y"]), px(p["end"]), py(p["end_y"]), fill=peak, dash=(3, 2))
+            c.create_line(ax, ay - 2, ax, ay - 12, fill=peak)
+            c.create_text(ax, ay - 14, text=str(p["no"]), anchor="s", font=theme.font(8), fill=peak)
             n += 1
         return n
 
@@ -1064,6 +1145,7 @@ class V31Mixin:
                            command=self._hs_draw).pack(side="left")
         tk.Label(bar, text=tr("（按住 Ctrl / Shift 多选，最多叠加 10 条）"), fg="#777").pack(side="left", padx=6)
         self.hs_canvas = tk.Canvas(mid, bg="white", highlightthickness=1, highlightbackground="#d0d7de", height=300)
+        theme.set_roles(self.hs_canvas, background="chart_bg", highlightbackground="border", highlightcolor="border")
         self.hs_canvas.pack(fill="both", expand=True, pady=4)
         self.hs_canvas.bind("<Configure>", lambda _e: self._hs_draw())
 
@@ -1138,29 +1220,35 @@ class V31Mixin:
         except Exception:  # noqa
             return
         c.delete("all")
+        pal = self._pal                         # v3.3：网格线、坐标轴、文字、曲线调色板都跟随主题
+        try:
+            c.configure(bg=pal["chart_bg"])
+        except Exception:  # noqa
+            pass
         if not self._hs_overlay:
-            c.create_text(w / 2, h / 2, text=tr("选中周期后点“叠加对比所选周期”"), fill="#777")
+            c.create_text(w / 2, h / 2, text=tr("选中周期后点“叠加对比所选周期”"), fill=pal["text_muted"])
             return
         lay = self._hist_mod.overlay_layout(self._hs_overlay, self.hs_series.get(), w, h)
         if not lay["ok"]:
-            c.create_text(w / 2, h / 2, text=tr(lay["msg"]), fill="#777")
+            c.create_text(w / 2, h / 2, text=tr(lay["msg"]), fill=pal["text_muted"])
             return
         x0, y0, x1, y1 = lay["box"]
-        font = ("Microsoft YaHei", 8)
+        font = theme.font(8)
         for px_, label in lay["xticks"]:
-            c.create_line(px_, y0, px_, y1, fill="#eef1f4")
-            c.create_text(px_, y1 + 4, text=label, anchor="n", font=font, fill="#57606a")
+            c.create_line(px_, y0, px_, y1, fill=pal["chart_grid"])
+            c.create_text(px_, y1 + 4, text=label, anchor="n", font=font, fill=pal["chart_axis"])
         for py_, label in lay["yticks"]:
-            c.create_line(x0, py_, x1, py_, fill="#eef1f4")
-            c.create_text(x0 - 4, py_, text=label, anchor="e", font=font, fill="#57606a")
-        c.create_rectangle(x0, y0, x1, y1, outline="#8c959f")
-        for i, (color, flat, legend) in enumerate(lay["lines"]):
+            c.create_line(x0, py_, x1, py_, fill=pal["chart_grid"])
+            c.create_text(x0 - 4, py_, text=label, anchor="e", font=font, fill=pal["chart_axis"])
+        c.create_rectangle(x0, y0, x1, y1, outline=pal["chart_frame"])
+        for i, (_color, flat, legend) in enumerate(lay["lines"]):
+            color = theme.series_color(self._theme_name, i)
             if len(flat) >= 4:
                 c.create_line(*flat, fill=color, width=1)
             ly = y0 + 4 + i * 14
             c.create_line(x1 + 8, ly + 6, x1 + 26, ly + 6, fill=color, width=2)
-            c.create_text(x1 + 30, ly, text=legend[-40:], anchor="nw", font=font, fill="#333")
-        c.create_text((x0 + x1) / 2, h - 2, text=tr("时间（%s）") % "s", anchor="s", font=font, fill="#333")
+            c.create_text(x1 + 30, ly, text=legend[-40:], anchor="nw", font=font, fill=pal["chart_text"])
+        c.create_text((x0 + x1) / 2, h - 2, text=tr("时间（%s）") % "s", anchor="s", font=font, fill=pal["chart_text"])
 
     def _hs_export(self):
         ids = self._hs_selected()
@@ -1432,8 +1520,7 @@ class V31Mixin:
         self._perm(tk.Button(sec, text=tr("保存报表设置"), command=self._rp_save_settings), "config").pack(anchor="w", pady=4)
 
     def _scroll_text(self, parent, height):
-        from tkinter import scrolledtext
-        w = scrolledtext.ScrolledText(parent, height=height, state="disabled", wrap="word")
+        w = self._scrolled_text(parent, height=height, state="disabled", wrap="word")
         w.pack(fill="both", expand=True, pady=4)
         return w
 
@@ -1493,8 +1580,11 @@ class V31Mixin:
                 lines.append("  %s：%s %d，%s %d，%s" % (df.translate_label(r["label"]), tr("周期"), r["cycles"],
                                                        tr("告警"), r["alerts"], tr(r["status"])))
             lines += [tr("文件：")] + ["  " + f for f in files]
-            self._set_text(self.rp_out, "\n".join(lines))
+            self._rp_show("\n".join(lines))
         self._bg(work, done)
+
+    def _rp_show(self, text):
+        self._set_text(self.rp_out, text)
 
     def _rp_save_settings(self):
         rp = self._rp
@@ -1533,12 +1623,9 @@ class V31Mixin:
         self.root.after(60000, self._poll_reports)
 
     # ---- 备份与审计 ----
-    def _build_backup_tab(self, nb):
+    def _sec_backup_export(self, inner):
+        """v3.1「备份与审计」页的「导出配置备份」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
         tk, ttk = self.tk, self.ttk
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("备份与审计"))
-        self.tab_backup = tab
-        inner = _scrollable(tab, tk, ttk)
         sec = self._section(inner, tr("导出配置备份"))
         tk.Label(sec, text=tr("打包 config.json（含账号密码哈希）、certs 下的 OPC UA 与网页证书和私钥、信任的客户端证书，可选日志。"
                               "备份里有私钥，强烈建议设置密码加密（AES-256-GCM）。"),
@@ -1556,6 +1643,9 @@ class V31Mixin:
         tk.Checkbutton(row, text=tr("包含日志"), variable=self.bk_logs).pack(side="left", padx=8)
         self._perm(tk.Button(row, text=tr("导出备份…"), command=self._bk_export), "backup").pack(side="left", padx=8)
 
+    def _sec_backup_restore(self, inner):
+        """v3.1「备份与审计」页的「从备份还原」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("从备份还原"))
         row = tk.Frame(sec)
         row.pack(fill="x", pady=2)
@@ -1579,8 +1669,11 @@ class V31Mixin:
         self._perm(tk.Button(row, text=tr("预览所选自动备份"), command=self._bk_restore_auto), "restore").pack(side="left", padx=4)
         self._bk_render_auto()
 
+    def _sec_roles(self, inner):
+        """v3.1「备份与审计」页的「账号与角色」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("账号与角色"))
-        tk.Label(sec, text=tr("账号与 OPC UA 登录账号是同一套（在“系统设置 → 登录账号”添加）。没有指定角色的账号按操作员。"),
+        tk.Label(sec, text=tr("账号与 OPC UA 登录账号是同一套（在“系统 › 安全与账号”添加）。没有指定角色的账号按操作员。"),
                  fg="#777", anchor="w", justify="left", wraplength=860).pack(fill="x")
         cols = ("user", "role")
         self.ur_tree = ttk.Treeview(sec, columns=cols, show="headings", height=5)
@@ -1605,6 +1698,9 @@ class V31Mixin:
         self._perm(tk.Button(row, text=tr("保存"), command=self._ur_save_auth), "users").pack(side="left", padx=6)
         self._ur_render()
 
+    def _sec_audit_log(self, inner):
+        """v3.1「备份与审计」页的「操作审计日志」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("操作审计日志"))
         row = tk.Frame(sec)
         row.pack(fill="x", pady=2)
@@ -1729,7 +1825,7 @@ class V31Mixin:
             self._bk_render_auto()
             msg = tr("已还原 %d 个文件。还原前的配置已备份到：%s") % (len(r["written"]), r["auto_backup"] or "-")
             if r["smtp_cleared"]:
-                msg += "\n" + tr("备份来自另一台电脑：SMTP 密码无法在本机解密，已清空，请在“告警与通知”里重新填写。")
+                msg += "\n" + tr("备份来自另一台电脑：SMTP 密码无法在本机解密，已清空，请在“监控 › 告警 → 通知设置”里重新填写。")
             try:
                 self.cfg = self._fresh_cfg()
             except Exception:  # noqa
@@ -1832,6 +1928,1111 @@ class V31Mixin:
         self._show(True, tr("已导出 %d 条：%s") % (len(rows), path))
 
 
+class _ModProxy:
+    """tkinter / ttk 模块的包装（v3.3）：没覆盖的名字原样转给真模块。"""
+
+    def __init__(self, mod, **over):
+        self._mod = mod
+        for k, v in over.items():
+            setattr(self, k, v)
+
+    def __getattr__(self, name):
+        return getattr(self._mod, name)
+
+
+def _themed_modules(tk, ttk, kind_of):
+    """v3.3：窗口代码里的 tk.Button / tk.Entry / tk.Checkbutton / tk.Radiobutton 换成 ttk 版本，
+    外观由 ttk.Style 主题统一控制（扁平、悬停、深浅色即时切换）；ttk.Treeview 插入行时自动加斑马纹。
+    这几种控件在本程序里只用到 text / command / textvariable / variable / value / show / width / state，
+    ttk 版本完全支持；个别经典专用参数（fg / bg / relief / padx …）在这里去掉，避免 TclError。
+    kind_of(text) -> 按钮样式名（主按钮 / 次按钮 / 危险按钮），没指定 style 时按文字自动选。"""
+    drop = ("fg", "bg", "foreground", "background", "relief", "padx", "pady", "font", "bd", "borderwidth",
+            "activebackground", "activeforeground", "highlightthickness", "selectcolor", "insertbackground",
+            "disabledforeground", "anchor", "justify", "wraplength", "overrelief")
+
+    def clean(kw):
+        for k in drop:
+            kw.pop(k, None)
+        return kw
+
+    def button(master=None, **kw):
+        if "style" not in kw:
+            kw["style"] = kind_of(kw.get("text", ""))
+        return ttk.Button(master, **clean(kw))
+
+    def entry(master=None, **kw):
+        return ttk.Entry(master, **clean(kw))
+
+    def check(master=None, **kw):
+        return ttk.Checkbutton(master, **clean(kw))
+
+    def radio(master=None, **kw):
+        return ttk.Radiobutton(master, **clean(kw))
+
+    base = ttk.Treeview
+
+    def _insert(tree, parent, index, iid=None, **kw):
+        if parent in ("", None):
+            try:
+                n = len(tree.get_children(""))
+            except Exception:  # noqa
+                n = 0
+            tags = kw.get("tags") or ()
+            if isinstance(tags, str):
+                tags = (tags,)
+            kw["tags"] = theme.zebra_tags(n, tuple(tags))
+        if iid is not None:
+            kw["iid"] = iid
+        return base.insert(tree, parent, index, **kw)
+    tree_cls = type("ThemedTreeview", (base,), {"insert": _insert})
+    return (_ModProxy(tk, Button=button, Entry=entry, Checkbutton=check, Radiobutton=radio),
+            _ModProxy(ttk, Treeview=tree_cls))
+
+
+class V33Mixin:
+    """DesktopWindow 的 v3.3 部分：现代主题（浅色 / 深色 / 跟随系统，即时切换）、高 DPI、字体。
+    调色板、样式表、对比度、着色规则都在不依赖 tkinter 的 theme.py；这里只把它们用到真实控件上。"""
+
+    # ---- 初始化（建 Tk 根窗口之前）----
+    def _v33_pre(self):
+        self._theme_setting = theme.normalize_theme(self.cfg.get("desktop_theme", theme.DEFAULT_THEME))
+        self._theme_name = theme.resolve_theme(self._theme_setting)
+        self._pal = theme.palette(self._theme_name)
+        self._ui_scale = 1.0
+        self._style = None
+        self._card_parts = {}
+        self._nav_bars = {}
+        self._nav_rows = {}
+        self._nav_hover = None
+        self._theme_combo = None
+        self.theme_menu_var = None
+        try:      # 必须在创建 Tk 之前：声明 DPI 感知，125% / 150% 缩放下文字清晰不模糊
+            self._dpi_mode = theme.enable_dpi_awareness()
+        except Exception:  # noqa
+            self._dpi_mode = ""
+
+    def _btn_kind_style(self, text):
+        try:
+            src = untr(text) if isinstance(text, str) else ""
+        except Exception:  # noqa
+            src = text if isinstance(text, str) else ""
+        return theme.button_style(theme.button_kind(src or text))
+
+    # ---- 建 Tk 根窗口之后：DPI、字体、主题 ----
+    def _setup_dpi(self, root):
+        dpi = None
+        try:
+            dpi = theme.system_dpi()
+        except Exception:  # noqa
+            dpi = None
+        if not dpi:
+            try:
+                dpi = float(root.winfo_fpixels("1i"))
+            except Exception:  # noqa
+                dpi = 96.0
+        self._dpi = theme.clamp_dpi(dpi)
+        self._ui_scale = theme.ui_scale(self._dpi)
+        if self._dpi_mode:                  # 只有声明了 DPI 感知才按真实 DPI 设置（否则系统会再放大一次）
+            try:
+                root.tk.call("tk", "scaling", theme.tk_scaling(self._dpi))
+            except Exception:  # noqa
+                pass
+        return self._ui_scale
+
+    def _px(self, v):
+        return theme.px(v, self._ui_scale)
+
+    def _setup_fonts(self, root):
+        try:
+            from tkinter import font as tkfont
+            fams = tkfont.families(root)
+        except Exception:  # noqa
+            return None
+        fam = theme.pick_font(fams)
+        mono = theme.pick_font(fams, theme.MONO_CANDIDATES)
+        theme.set_fonts(fam, mono)
+        for name, (size, weight, is_mono) in theme.NAMED_FONTS.items():
+            try:
+                try:
+                    f = tkfont.nametofont(name, root=root)
+                except TypeError:                  # Python 3.9 及以前没有 root 参数
+                    f = tkfont.nametofont(name)
+                kw = {"size": size, "weight": weight}
+                if (mono if is_mono else fam):
+                    kw["family"] = mono if is_mono else fam
+                f.configure(**kw)
+            except Exception:  # noqa
+                pass
+        try:
+            self._linespace = int(tkfont.Font(root=root, font=theme.font("body")).metrics("linespace"))
+        except Exception:  # noqa
+            self._linespace = None
+        return fam
+
+    def _theme_fonts(self):
+        return {"body": theme.font("body"), "bold": theme.font("body", "bold"), "small": theme.font("small"),
+                "tab": theme.font("body"), "mono": theme.font("mono", mono=True)}
+
+    def _apply_theme(self, initial=False):
+        """应用当前调色板：ttk 样式（以 clam 为底）、Tk 选项数据库、已建好的经典控件、图表与动态颜色。"""
+        pal = self._pal
+        root = self.root
+        try:
+            if self._style is None:
+                self._style = self.ttk.Style(root)
+            theme.apply_ttk(self._style, pal, theme.metrics(self._ui_scale, getattr(self, "_linespace", None)),
+                            self._theme_fonts())
+        except Exception as e:  # noqa  样式出错不能影响窗口
+            self.sa.get_log().warning("应用界面主题失败：%s", e)
+        theme.apply_option_db(root, pal, self._theme_fonts())
+        try:
+            root.configure(bg=pal["bg"])
+        except Exception:  # noqa
+            pass
+        if initial:
+            return 0
+        n = self._theme_paint(root)
+        for top in list(getattr(self, "_popups", []) or []):
+            n += self._theme_paint(top)
+        self._theme_refresh_dynamic()
+        return n
+
+    def _theme_paint(self, widget, parent_role=None):
+        """按角色给控件树上色（新建页面、弹窗后调用；切换主题时对整个窗口调用）。"""
+        if parent_role is None:
+            parent_role = "bg"
+            try:
+                parent = widget.master if widget is not self.root else None
+                r = getattr(parent, "_theme_bg", None) if parent is not None else None
+                if isinstance(r, str) and r in self._pal:
+                    parent_role = r
+            except Exception:  # noqa
+                pass
+        try:
+            return theme.paint_tree(widget, self._pal, parent_role)
+        except Exception as e:  # noqa
+            self.sa.get_log().warning("界面着色出错：%s", e)
+            return 0
+
+    def _theme_refresh_dynamic(self):
+        """颜色由代码动态决定的部分：导航高亮、状态指示灯、总览卡片、日志级别色、图表重画。"""
+        for fn in (self._nav_refresh, self._poll_service_text, self._render_overview, self._update_log_toggle,
+                   self._log_tags, lambda: self._pv_draw(force=True), self._hs_draw,
+                   lambda: self._st_chart(getattr(self, "_st_last", None) or {})):
+            try:
+                fn()
+            except Exception:  # noqa
+                pass
+
+    def _log_tags(self):
+        box = getattr(self, "box", None)
+        if box is None:
+            return
+        for tag, kw in theme.log_tags(self._pal).items():
+            try:
+                box.tag_configure(tag, **kw)
+            except Exception:  # noqa
+                pass
+
+    def _set_theme(self, code):
+        """切换主题（浅色 / 深色 / 跟随系统）：保存 desktop_theme，立即重新应用样式并刷新所有已建页面。"""
+        setting = theme.normalize_theme(code)
+        old = self._theme_name
+        self._theme_setting = setting
+        self._theme_name = theme.resolve_theme(setting)
+        self._pal = theme.palette(self._theme_name)
+        try:
+            config_tools.update_settings(self.cfg["_cfg_path"], {"desktop_theme": setting})
+            self.cfg["desktop_theme"] = setting
+            self._audit("theme", "desktop_theme", None, {"desktop_theme": setting})
+        except Exception as e:  # noqa
+            self.sa.get_log().error("保存界面主题失败：%s", e)
+        self._sync_theme_controls()
+        n = self._apply_theme()
+        self.sa.get_log().info("界面主题已切换为 %s（%s → %s，刷新 %d 个控件）", setting, old, self._theme_name, n)
+        return self._theme_name
+
+    def _sync_theme_controls(self):
+        codes = [c for c, _t in theme.THEME_OPTIONS]
+        try:
+            if self.theme_menu_var is not None:
+                self.theme_menu_var.set(self._theme_setting)
+        except Exception:  # noqa
+            pass
+        try:
+            if self._theme_combo is not None:
+                self._theme_combo.current(codes.index(self._theme_setting))
+        except Exception:  # noqa
+            pass
+
+    def _theme_menu(self, parent_menu):
+        """“视图”菜单里的“主题”子菜单：浅色 / 深色 / 跟随系统（单选）。"""
+        tk = self.tk
+        m = tk.Menu(parent_menu, tearoff=0)
+        self.theme_menu_var = tk.StringVar(value=self._theme_setting)
+        for code, label in theme.THEME_OPTIONS:
+            m.add_radiobutton(label=tr(label), value=code, variable=self.theme_menu_var,
+                              command=lambda c=code: self._set_theme(c))
+        parent_menu.add_separator()
+        parent_menu.add_cascade(label=tr(theme.MENU_TITLE), menu=m)
+        return m
+
+    def _build_theme_row(self, sec):
+        """常用设置 → 常用 → “界面语言与主题”区域里的主题下拉框。"""
+        tk, ttk = self.tk, self.ttk
+        row = tk.Frame(sec)
+        row.pack(fill="x", pady=2)
+        tk.Label(row, text=tr(theme.SECTION_LABEL), width=26, anchor="w").pack(side="left")
+        codes = [c for c, _t in theme.THEME_OPTIONS]
+        self._theme_combo = ttk.Combobox(row, values=[tr(t) for _c, t in theme.THEME_OPTIONS], state="readonly",
+                                         width=16)
+        self._theme_combo.pack(side="left")
+        self._theme_combo.current(codes.index(self._theme_setting) if self._theme_setting in codes else 2)
+        self._theme_combo.bind("<<ComboboxSelected>>",
+                               lambda _e: self._set_theme(codes[max(0, self._theme_combo.current())]))
+        tk.Label(sec, text=tr(theme.HINT), fg="#777", anchor="w", justify="left", wraplength=860).pack(fill="x")
+
+    def _scrolled_text(self, parent, **kw):
+        """带 ttk 滚动条的多行文本框（代替 scrolledtext.ScrolledText 里的经典滚动条，跟随主题）。"""
+        from tkinter import scrolledtext
+        kw.setdefault("relief", "flat")
+        kw.setdefault("bd", 0)
+        kw.setdefault("highlightthickness", 1)
+        kw.setdefault("padx", self._px(6))
+        kw.setdefault("pady", self._px(4))
+        kw.setdefault("font", theme.font("mono", mono=True))
+        w = scrolledtext.ScrolledText(parent, **kw)
+        try:
+            old = w.vbar
+            bar = self.ttk.Scrollbar(w.frame, orient="vertical", command=w.yview)
+            old.destroy()
+            bar.pack(side="right", fill="y", before=w)
+            w.configure(yscrollcommand=bar.set)
+            w.vbar = bar
+        except Exception:  # noqa  换不了就用原来的滚动条
+            pass
+        return w
+
+    # ---- 导航悬停 / 卡片悬停 ----
+    def _nav_enter(self, pid):
+        self._nav_hover = pid
+        self._nav_paint_item(pid)
+
+    def _nav_leave(self, pid):
+        if self._nav_hover == pid:
+            self._nav_hover = None
+        self._nav_paint_item(pid)
+
+    def _nav_paint_item(self, pid):
+        it = self._nav_items.get(pid)
+        if it is None:
+            return
+        pal = self._pal
+        sel = pid == self.pages.current
+        ok = not getattr(it, "_locked", False)
+        if sel:
+            bg, fg, bar = "nav_sel_bg", "nav_sel_text", "nav_bar"
+        elif pid == self._nav_hover:
+            bg, fg, bar = "nav_hover", ("nav_text" if ok else "nav_locked"), "nav_hover"
+        else:
+            bg, fg, bar = "nav_bg", ("nav_text" if ok else "nav_locked"), "nav_bg"
+        try:
+            it.configure(bg=pal[bg], fg=pal[fg], font=theme.font("nav", "bold" if sel else "normal"))
+            theme.set_roles(it, background=bg, foreground=fg)
+        except Exception:  # noqa
+            pass
+        for w, role in ((self._nav_rows.get(pid), bg), (self._nav_bars.get(pid), bar)):
+            if w is None:
+                continue
+            try:
+                w.configure(bg=pal[role])
+                theme.set_roles(w, background=role)
+            except Exception:  # noqa
+                pass
+
+    def _card_widgets(self, key):
+        card, t, v, s = self._cards[key]
+        parts = self._card_parts.get(key, {})
+        return card, [w for w in (parts.get("body"), parts.get("head"), parts.get("icon"), t, v, s) if w is not None]
+
+    def _card_hover(self, key, on, event=None):
+        if key not in self._cards:
+            return
+        card, inner = self._card_widgets(key)
+        if not on and event is not None:      # 从卡片移到卡片里的文字上也会触发 <Leave>：还在卡片里就不算离开
+            try:
+                w = self.root.winfo_containing(event.x_root, event.y_root)
+                while w is not None:
+                    if w is card:
+                        return
+                    w = w.master
+            except Exception:  # noqa
+                pass
+        pal = self._pal
+        bg = "card_hover" if on else "card"
+        try:
+            card.configure(bg=pal[bg], highlightbackground=pal["primary" if on else "border"],
+                           highlightcolor=pal["primary" if on else "border"])
+            theme.set_roles(card, background=bg, highlightbackground="primary" if on else "border",
+                            highlightcolor="primary" if on else "border")
+        except Exception:  # noqa
+            pass
+        for w in inner:
+            try:
+                w.configure(bg=pal[bg])
+                theme.set_roles(w, background=bg)
+            except Exception:  # noqa
+                pass
+        self._card_hovered = key if on else None
+
+
+class V32Mixin:
+    """DesktopWindow 的 v3.2 部分：左侧分组导航 + 右侧内容区、顶部工具栏、底部状态栏与可折叠日志面板、
+    页面懒加载（首次打开才建控件）、只刷新可见页面、记住上次页面和窗口大小、无权限页面带锁灰显。
+    导航结构（分组、页面、所需权限、区域组成）全部来自不依赖 tkinter 的 ui_layout.py。"""
+
+    # v3.2 的导航颜色（v3.3 起由 theme.PALETTES 的 nav_* 角色决定，这里只保留名字兼容旧代码）
+    NAV_BG = theme.PALETTES["light"]["nav_bg"]
+    NAV_SEL = theme.PALETTES["light"]["nav_sel_bg"]
+    NAV_FG = theme.PALETTES["light"]["nav_text"]
+    NAV_LOCKED_FG = theme.PALETTES["light"]["nav_locked"]
+
+    # ---- 初始化（_v31_pre 之后、建控件之前）----
+    def _v32_pre(self):
+        import modbus_server
+        import reports
+        self._rp, self._ms = reports, modbus_server
+        self.pages = ui_layout.PageManager(self._build_page)
+        for name, pid in ui_layout.RENDER_GUARDS:          # 渲染方法：页面不可见时只记下参数
+            fn = getattr(self, name, None)
+            if fn is not None:
+                setattr(self, name, self.pages.guard(name, pid, fn))
+        self._page_frames = {}
+        self._subnb = {}
+        self._nav_items = {}
+        self._nav_heads = {}
+        self._nav_collapsed = set()
+        self._cards = {}
+        self._sess_res = None
+        self._log_open = False
+        self._log_new = 0
+        self._log_lines = 0
+        self._img_lock = self._img_blank = None
+
+    def _visible(self, pid):
+        return self.pages.is_visible(pid)
+
+    # ---- 顶部工具栏 ----
+    def _build_toolbar(self, root):
+        tk, ttk = self.tk, self.ttk
+        # v3.3：工具栏白底（深色主题为深灰）+ 底部 1 像素分隔线；按钮扁平，启动 = 主按钮，停止 = 危险按钮
+        outer = tk.Frame(root)
+        outer.pack(side="top", fill="x")
+        theme.set_roles(outer, background="toolbar_bg")
+        bar = tk.Frame(outer)
+        bar.pack(side="top", fill="x", padx=self._px(10), pady=(self._px(6), self._px(6)))
+        line = tk.Frame(outer, height=1)
+        line.pack(side="bottom", fill="x")
+        theme.set_roles(line, background="border")
+        self.toolbar = bar
+        self.status_short = tk.StringVar(value=tr("已停止"))
+        self.status_dot = tk.Label(bar, text="●", fg=ui_layout.COLORS["stopped"], font=theme.font("dot"))
+        self.status_dot.pack(side="left")
+        self.status_lbl = tk.Label(bar, textvariable=self.status_short, anchor="w", fg="#57606a",
+                                   font=theme.font(10, "bold"))
+        self.status_lbl.pack(side="left", padx=(self._px(4), self._px(12)))
+        self.btn_start = tk.Button(bar, text=tr("▶ 启动服务"), command=self._start_service, style=theme.STYLE["primary"])
+        self.btn_start.pack(side="left", padx=2)
+        self.btn_stop = tk.Button(bar, text=tr("■ 停止服务"), command=self._stop_service, style=theme.STYLE["danger"])
+        self.btn_stop.pack(side="left", padx=2)
+        self.btn_restart = tk.Button(bar, text=tr("重启服务"), command=self._restart_service,
+                                     style=theme.STYLE["toolbar"])
+        self.btn_restart.pack(side="left", padx=2)
+        # 右侧（从右往左排）：网页设置页、语言、登录栏
+        self.btn_web = tk.Button(bar, text=tr("网页设置"), command=self._open_web, style=theme.STYLE["toolbar"])
+        self.btn_web.pack(side="right", padx=(6, 0))
+        codes = [c for c, _t in LANG_OPTIONS]
+        labels = [i18n.LANG_NAMES.get(c, c) for c in codes]          # 双语固定文字，任何语言下都认得出来
+        self.tb_lang = ttk.Combobox(bar, values=labels, state="readonly",
+                                    width=max(len(x) for x in labels) + 1)
+        cur = str(self.cfg.get("desktop_language", "auto"))
+        self.tb_lang.current(codes.index(cur) if cur in codes else 0)
+        self.tb_lang.bind("<<ComboboxSelected>>",
+                          lambda _e: self._set_language(codes[max(0, self.tb_lang.current())]))
+        self.tb_lang.pack(side="right", padx=4)
+        self._build_login_bar(bar)
+        self._tb_compact = False
+        self._tb_full_req = 0
+        try:
+            bar.bind("<Configure>", lambda e: self._toolbar_fit(getattr(e, "width", 0)), add="+")
+        except Exception:  # noqa
+            pass
+
+    def _toolbar_fit(self, width=None):
+        """v3.3：工具栏宽度不够时切换到紧凑模式（当前用户只显示用户名 / 角色），够了再恢复完整文字。"""
+        bar = self.toolbar
+        try:
+            width = int(width or bar.winfo_width())
+            need = int(bar.winfo_reqwidth())
+        except Exception:  # noqa
+            return getattr(self, "_tb_compact", False)
+        if width < 100:
+            return self._tb_compact
+        full, short = getattr(self, "_user_text", ("", ""))
+        if not self._tb_compact and need > width:
+            self._tb_compact, self._tb_full_req = True, need
+            self.user_var.set(short)
+        elif self._tb_compact and width >= self._tb_full_req:
+            self._tb_compact = False
+            self.user_var.set(full)
+        return self._tb_compact
+
+    # ---- 底部状态栏 ----
+    def _build_statusbar(self, root):
+        tk = self.tk
+        bar = tk.Frame(root)
+        bar.pack(side="bottom", fill="x")
+        theme.set_roles(bar, background="status_bg")
+        line = tk.Frame(bar, height=1)
+        line.pack(side="top", fill="x")
+        theme.set_roles(line, background="border")
+        self.statusbar = bar
+        self.sb_vars = []
+        for i in range(5):
+            v = tk.StringVar(value="")
+            lb = tk.Label(bar, textvariable=v, anchor="w", font=theme.font("status"))
+            lb.pack(side="left", padx=(self._px(10) if i == 0 else self._px(4), self._px(4)), pady=self._px(2))
+            theme.set_roles(lb, background="status_bg", foreground="status_text")
+            if i < 4:
+                sep = tk.Label(bar, text="|", font=theme.font("status"))
+                sep.pack(side="left")
+                theme.set_roles(sep, background="status_bg", foreground="border_strong")
+            self.sb_vars.append(v)
+        self.btn_log = tk.Button(bar, text="", command=self._toggle_log_panel, style=theme.STYLE["status"])
+        self.btn_log.pack(side="right", padx=self._px(4))
+        self._update_log_toggle()
+        self._update_statusbar()
+
+    def _svc_info(self):
+        return {"running": self.svc.running(), "up": self.svc.is_up(), "error": self.svc.error,
+                "busy": self._busy, "endpoint": (self.svc.cfg or self.cfg).get("endpoint")}
+
+    def _update_statusbar(self):
+        try:
+            items = ui_layout.status_bar_items(self._svc_info(), self._last_alerts or
+                                               ({} if self.svc.is_up() else {"offline": True}),
+                                               self._sess_res, tr=tr)
+            for v, text in zip(self.sb_vars, items):
+                v.set(text)
+        except Exception:  # noqa  状态栏出错不能影响窗口
+            pass
+
+    # ---- 底部可折叠日志面板 ----
+    def _build_log_panel(self, root):
+        tk = self.tk
+        panel = tk.Frame(root)
+        self.log_panel = panel
+        line = tk.Frame(panel, height=1)
+        line.pack(side="top", fill="x")
+        theme.set_roles(line, background="border")
+        head = tk.Frame(panel)
+        head.pack(fill="x", padx=8, pady=(4, 0))
+        tk.Label(head, text=tr("运行日志"), anchor="w", fg="#555", font=theme.font(10, "bold")).pack(side="left")
+        tk.Button(head, text=tr("清空显示"), command=self._clear_log, style=theme.STYLE["toolbar"]).pack(
+            side="right", padx=2)
+        tk.Button(head, text=tr("打开日志文件"), command=self._open_log_file, style=theme.STYLE["toolbar"]).pack(
+            side="right", padx=2)
+        tk.Button(head, text=tr("打开日志文件夹"), command=self._open_logs, style=theme.STYLE["toolbar"]).pack(
+            side="right", padx=2)
+        # v3.3：等宽字体，按级别着色（DEBUG 灰 / INFO 正文色 / WARNING 黄 / ERROR 红）
+        self.box = self._scrolled_text(panel, height=9, state="disabled", font=theme.font("mono", mono=True))
+        self.box.pack(fill="both", expand=True, padx=8, pady=(2, 4))
+        self._log_tags()
+        # 默认收起：整个面板不占主区，点状态栏右侧“▲ 运行日志”展开
+
+    def _toggle_log_panel(self, force=None):
+        want = (not self._log_open) if force is None else bool(force)
+        self._log_open = want
+        try:
+            if want:
+                self.log_panel.pack(side="bottom", fill="x", before=self.statusbar)
+                self._log_new = 0
+            else:
+                self.log_panel.pack_forget()
+        except Exception:  # noqa
+            pass
+        self._update_log_toggle()
+
+    def _update_log_toggle(self):
+        try:
+            if self._log_open:
+                text = "▼ " + tr("运行日志")
+            elif self._log_new:
+                text = "▲ " + tr("运行日志（%d 条新警告 / 错误）") % self._log_new
+            else:
+                text = "▲ " + tr("运行日志")
+            alert = bool(self._log_new and not self._log_open)      # v3.3：有新警告 / 错误时按钮变红加粗
+            self.btn_log.configure(text=text, style=theme.STYLE["status_alert" if alert else "status"])
+        except Exception:  # noqa
+            pass
+
+    # ---- 左侧导航 + 右侧内容区 ----
+    def _build_body(self, root):
+        tk = self.tk
+        body = tk.Frame(root)
+        body.pack(side="top", fill="both", expand=True)
+        self.body = body
+        self.nav = tk.Frame(body, width=self._px(180))
+        theme.set_roles(self.nav, background="nav_bg")
+        self.nav.pack(side="left", fill="y")
+        try:
+            self.nav.pack_propagate(False)
+        except Exception:  # noqa
+            pass
+        sep = tk.Frame(body, width=1)
+        sep.pack(side="left", fill="y")
+        theme.set_roles(sep, background="border")
+        right = tk.Frame(body)
+        right.pack(side="left", fill="both", expand=True)
+        self.content = right
+        head = tk.Frame(right)
+        head.pack(side="top", fill="x", padx=self._px(14), pady=(self._px(10), self._px(2)))
+        self.crumb_var = tk.StringVar(value="")
+        tk.Label(head, textvariable=self.crumb_var, anchor="w", fg="#1f4e79",
+                 font=theme.font("crumb", "bold")).pack(side="left")
+        self.page_area = tk.Frame(right)
+        self.page_area.pack(side="top", fill="both", expand=True, padx=self._px(6), pady=(2, 2))
+        # 底部保存栏：只在有表单字段的页面显示（与 v3.1 底部保存栏、网页版 savebar 对应）
+        self.savebar = tk.Frame(right, highlightthickness=1)
+        theme.set_roles(self.savebar, background="surface", highlightbackground="border", highlightcolor="border")
+        tk.Label(self.savebar, textvariable=self.dirty_txt, anchor="w").pack(side="left", padx=self._px(8))
+        tk.Label(self.savebar, text=tr("（OPC UA 服务 / 高级设置 / 告警通知 等表单）"), fg="#777").pack(side="left")
+        tk.Button(self.savebar, text=tr("放弃修改"), command=self._reload, style=theme.STYLE["secondary"]).pack(
+            side="right", padx=(4, self._px(8)), pady=self._px(5))
+        tk.Button(self.savebar, text=tr("保存设置"), command=self._save, style=theme.STYLE["primary"]).pack(
+            side="right", padx=4, pady=self._px(5))
+        self._savebar_shown = False
+        self._make_icons()
+        self._build_nav()
+
+    def _make_icons(self):
+        tk = self.tk
+        try:
+            self._img_lock = tk.PhotoImage(data=ui_layout.LOCK_ICON_PNG)
+            self._img_blank = tk.PhotoImage(width=ui_layout.ICON_PX, height=ui_layout.ICON_PX)
+        except Exception:  # noqa  极少数环境建不出图片：改用文字前缀
+            self._img_lock = self._img_blank = None
+
+    def _build_nav(self):
+        """v3.3：侧栏（浅色主题浅灰、深色主题深色）；分组标题小号加粗（英文大写）；每项左侧 3 像素色条，
+        选中时色条 + 高亮底色，鼠标悬停换底色；无权限的项锁图标 + 灰字。"""
+        tk = self.tk
+        pal = self._pal
+        top = tk.Frame(self.nav, height=self._px(6))
+        top.pack(fill="x")
+        theme.set_roles(top, background="nav_bg")
+        for g in ui_layout.GROUPS:
+            head = tk.Label(self.nav, text="", anchor="w", bg=pal["nav_bg"], fg=pal["nav_muted"], cursor="hand2",
+                            font=theme.font("head", "bold"), padx=self._px(14), pady=self._px(3))
+            theme.set_roles(head, background="nav_bg", foreground="nav_muted")
+            head.pack(fill="x", pady=(self._px(10), self._px(2)))
+            head.bind("<Button-1>", lambda _e, gid=g.gid: self._nav_toggle(gid))
+            box = tk.Frame(self.nav, bg=pal["nav_bg"])
+            theme.set_roles(box, background="nav_bg")
+            box.pack(fill="x")
+            self._nav_heads[g.gid] = (head, box)
+            for p in g.pages:
+                row = tk.Frame(box, bg=pal["nav_bg"], cursor="hand2")
+                row.pack(fill="x", padx=(0, self._px(6)))
+                bar = tk.Frame(row, width=self._px(3), bg=pal["nav_bg"])
+                bar.pack(side="left", fill="y")
+                kw = {"compound": "left", "image": self._img_blank} if self._img_blank is not None else {}
+                it = tk.Label(row, text=tr(p.title), anchor="w", bg=pal["nav_bg"], fg=pal["nav_text"],
+                              cursor="hand2", font=theme.font("nav"), padx=self._px(12), pady=self._px(6), **kw)
+                it.pack(side="left", fill="x", expand=True)
+                for w in (row, bar, it):
+                    w.bind("<Button-1>", lambda _e, pid=p.pid: self._nav_click(pid))
+                    w.bind("<Enter>", lambda _e, pid=p.pid: self._nav_enter(pid))
+                    w.bind("<Leave>", lambda _e, pid=p.pid: self._nav_leave(pid))
+                for w, role in ((row, "nav_bg"), (bar, "nav_bg"), (it, "nav_bg")):
+                    theme.set_roles(w, background=role)
+                theme.set_roles(it, foreground="nav_text")
+                self._nav_items[p.pid] = it
+                self._nav_rows[p.pid] = row
+                self._nav_bars[p.pid] = bar
+        self._nav_refresh()
+
+    def _nav_font_measure(self):
+        try:
+            from tkinter import font as tkfont
+            f = tkfont.Font(family=theme.font_family(), size=theme.FONT_SIZES["nav"], weight="bold")
+            return f.measure
+        except Exception:  # noqa
+            return None
+
+    def _nav_refresh(self):
+        """按当前语言、角色、所在页面刷新导航：文字、锁图标 / 灰显、选中高亮、折叠箭头、宽度。"""
+        can = self.session.can if hasattr(self, "session") else None
+        cur = self.pages.current
+        labels = []
+        for g in ui_layout.GROUPS:
+            head, _box = self._nav_heads.get(g.gid, (None, None))
+            text = ("▸ " if g.gid in self._nav_collapsed else "▾ ") + tr(g.title).upper()   # v3.3：英文分组标题大写
+            labels.append(text)
+            if head is not None:
+                try:
+                    head.configure(text=text)
+                except Exception:  # noqa
+                    pass
+            for p in g.pages:
+                it = self._nav_items.get(p.pid)
+                ok = ui_layout.allowed(p.pid, can)
+                title = tr(p.title)
+                if self._img_lock is None and not ok:
+                    title = ui_layout.LOCK_FALLBACK + title
+                labels.append("    " + title)
+                if it is None:
+                    continue
+                kw = {}
+                if self._img_lock is not None:
+                    kw["image"] = self._img_blank if ok else self._img_lock
+                try:
+                    it.configure(text=title, **kw)
+                except Exception:  # noqa
+                    pass
+                it._locked = not ok
+                self._nav_paint_item(p.pid)          # v3.3：选中 / 悬停 / 锁定的颜色来自当前主题
+        try:
+            self.nav.configure(width=ui_layout.nav_width(labels, self._nav_font_measure(), scale=self._ui_scale))
+        except Exception:  # noqa
+            pass
+        self._nav_labels = labels
+
+    def _nav_toggle(self, gid, collapse=None):
+        head, box = self._nav_heads[gid]
+        want = (gid not in self._nav_collapsed) if collapse is None else bool(collapse)
+        if want:
+            self._nav_collapsed.add(gid)
+            try:
+                box.pack_forget()
+            except Exception:  # noqa
+                pass
+        else:
+            self._nav_collapsed.discard(gid)
+            try:
+                box.pack(fill="x", after=head)
+            except Exception:  # noqa
+                pass
+        self._nav_refresh()
+
+    def _nav_expand_all(self):
+        for g in ui_layout.GROUPS:
+            self._nav_toggle(g.gid, collapse=False)
+
+    def _nav_collapse_all(self):
+        for g in ui_layout.GROUPS:
+            self._nav_toggle(g.gid, collapse=True)
+
+    def _go_home(self):
+        self._show_page(ui_layout.DEFAULT_PAGE)
+
+    def _role_name(self):
+        import audit
+        s = self.session
+        if not s.auth_enabled:
+            return tr("管理员")
+        return tr(audit.ROLE_NAMES.get(s.effective_role, s.effective_role))
+
+    def _nav_click(self, pid):
+        if not ui_layout.allowed(pid, self.session.can):
+            return self._locked_hint(pid)
+        self.session.touch()
+        return self._show_page(pid)
+
+    def _locked_hint(self, pid):
+        """点到无权限的页面：说明需要什么角色，问是否现在登录；登录后有权限就直接打开。"""
+        import audit
+        need = tr(audit.ROLE_NAMES.get(ui_layout.required_role(pid), "管理员"))
+        msg = ui_layout.lock_hint(pid, self._role_name(), tr=tr)
+        title = tr("需要“%s”权限") % need
+        if not self.session.auth_enabled:
+            return self._show(False, msg)
+        if self.mb.askyesno(title, msg + "\n\n" + tr("现在登录吗？"), parent=self.root):
+            self._login_dialog()
+            if ui_layout.allowed(pid, self.session.can):
+                return self._show_page(pid)
+        return None
+
+    def _show_page(self, pid):
+        """切换到某个页面：第一次打开才建控件（懒加载），之后只是显示 / 隐藏；补调页面不可见期间的刷新。"""
+        p = ui_layout.page(pid)
+        if p is None:
+            pid, p = ui_layout.DEFAULT_PAGE, ui_layout.page(ui_layout.DEFAULT_PAGE)
+        if not ui_layout.allowed(pid, self.session.can):
+            return self._locked_hint(pid)
+        old = self.pages.current
+        if old == pid and pid in self._page_frames:
+            return pid
+        if old in self._page_frames:
+            try:
+                self._page_frames[old].pack_forget()
+            except Exception:  # noqa
+                pass
+        g = ui_layout.group_of(pid)
+        if g is not None and g.gid in self._nav_collapsed:
+            self._nav_toggle(g.gid, collapse=False)
+        self.pages.show(pid)                 # 需要时先建页面，再补调记下的渲染
+        frame = self._page_frames.get(pid)
+        if frame is not None:
+            try:
+                frame.pack(fill="both", expand=True)
+            except Exception:  # noqa
+                pass
+        try:
+            if p.form and not self._savebar_shown:
+                self.savebar.pack(side="bottom", fill="x", padx=6, pady=(0, 4), before=self.page_area)
+                self._savebar_shown = True
+            elif not p.form and self._savebar_shown:
+                self.savebar.pack_forget()
+                self._savebar_shown = False
+        except Exception:  # noqa
+            pass
+        self._update_crumb()
+        self._nav_refresh()
+        for name in ui_layout.ON_SHOW.get(pid, ()):
+            try:
+                getattr(self, name)()
+            except Exception as e:  # noqa
+                self.sa.get_log().warning("页面 %s 刷新出错（%s）：%s", pid, name, e)
+        return pid
+
+    def _update_crumb(self):
+        try:
+            self.crumb_var.set(ui_layout.breadcrumb(self.pages.current, tr=tr))
+        except Exception:  # noqa
+            pass
+
+    def _select_subtab(self, pid, title):
+        nb = self._subnb.get(pid)
+        p = ui_layout.page(pid)
+        if nb is None or p is None:
+            return False
+        names = [t for t, _s in p.subtabs if t]
+        if title not in names:
+            return False
+        try:
+            nb.select(names.index(title))
+        except Exception:  # noqa
+            return False
+        return True
+
+    def _page_host(self, parent):
+        """页面容器：v3.1 的整页构建方法会调用 nb.add(tab, text=…)，这里把 tab 直接铺满容器。"""
+        tk = self.tk
+
+        def add(host, child, text="", **_kw):
+            child.pack(fill="both", expand=True)
+        cls = type("PageHost", (tk.Frame,), {"add": add})
+        return cls(parent)
+
+    def _build_page(self, pid):
+        """建一个页面（PageManager 只在第一次显示时调用）。"""
+        tk, ttk = self.tk, self.ttk
+        p = ui_layout.page(pid)
+        host = self._page_host(self.page_area)
+        self._page_frames[pid] = host
+        before = set(self._vars)
+        try:
+            if p.builder:
+                getattr(self, p.builder)(host)
+            else:
+                if p.intro:
+                    top = tk.Frame(host)
+                    top.pack(side="top", fill="x")
+                    getattr(self, p.intro)(top)
+                if any(t for t, _s in p.subtabs):
+                    nb = ttk.Notebook(host, style=theme.STYLE["subtabs"])
+                    nb.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+                    self._subnb[pid] = nb
+                    for title, secs in p.subtabs:
+                        tab = tk.Frame(nb)
+                        nb.add(tab, text=tr(title))
+                        inner = _scrollable(tab, tk, ttk)
+                        for s in secs:
+                            getattr(self, s)(inner)
+                else:
+                    inner = _scrollable(host, tk, ttk)
+                    for s in p.sections():
+                        getattr(self, s)(inner)
+        except Exception as e:  # noqa  页面建坏了：显示原因，其它页面照常
+            self.sa.get_log().error("页面 %s 加载失败：%s", pid, e)
+            try:
+                tk.Label(host, text=tr("页面加载失败：%s") % e, fg="#cf222e", anchor="w",
+                         justify="left", wraplength=640).pack(fill="x", padx=12, pady=12)
+            except Exception:  # noqa
+                pass
+            raise
+        finally:
+            new = set(self._vars) - before
+            if new and self._orig:
+                self._set_values(self._orig, keys=new)
+                self._mark_dirty()
+            self._apply_role()
+            self._fit_wraps(host)
+            self._theme_paint(host)              # v3.3：新建页面按当前主题着色
+
+    def _fit_wraps(self, host):
+        """说明文字原来按 860 像素换行；内容区变窄后按实际宽度换行，中英文都不截断。"""
+        labels = []
+
+        def walk(w):
+            try:
+                wl = int(str(w.cget("wraplength")) or 0)
+            except Exception:  # noqa
+                wl = 0
+            if wl >= 400:
+                try:
+                    pad = str(w.pack_info().get("padx", "0")).split()
+                    left = int(float(pad[0])) if pad else 0
+                except Exception:  # noqa
+                    left = 0
+                labels.append((w, left))
+            try:
+                kids = w.winfo_children()
+            except Exception:  # noqa
+                kids = []
+            for k in kids:
+                walk(k)
+        walk(host)
+        if not labels:
+            return
+
+        def on_conf(e):
+            width = getattr(e, "width", 0) or 0
+            if width < 200:
+                return
+            for w, left in labels:
+                try:
+                    w.configure(wraplength=max(240, width - left - 70))
+                except Exception:  # noqa
+                    pass
+        try:
+            host.bind("<Configure>", on_conf, add="+")
+        except Exception:  # noqa
+            pass
+
+    # ---- 总览（仪表盘）----
+    def _page_overview(self, nb):
+        tk = self.tk
+        tab = tk.Frame(nb)
+        nb.add(tab, text=tr("总览"))
+        grid = tk.Frame(tab)
+        grid.pack(fill="x", padx=self._px(10), pady=(self._px(8), self._px(4)))
+        self._cards = {}
+        self._card_parts = {}
+        pal = self._pal
+        cpx, cpy = theme.metrics(self._ui_scale)["card_pad"]
+        for i, (key, title, target) in enumerate(ui_layout.CARDS):
+            # v3.3 卡片：1 像素边框 + 顶部 3 像素状态色条（模拟圆角卡片的轻量感）、图标字符、大号数字；悬停时边框变主色
+            card = tk.Frame(grid, bg=pal["card"], highlightthickness=1, highlightbackground=pal["border"],
+                            highlightcolor=pal["border"], bd=0, cursor="hand2")
+            theme.set_roles(card, background="card", highlightbackground="border", highlightcolor="border")
+            card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=self._px(6), pady=self._px(6))
+            strip = tk.Frame(card, height=self._px(3), bg=pal["accent"])
+            strip.pack(side="top", fill="x")
+            theme.set_roles(strip, background="accent")
+            body = tk.Frame(card, bg=pal["card"], padx=cpx, pady=cpy, cursor="hand2")
+            body.pack(fill="both", expand=True)
+            theme.set_roles(body, background="card")
+            head = tk.Frame(body, bg=pal["card"])
+            head.pack(fill="x")
+            theme.set_roles(head, background="card")
+            icon = tk.Label(head, text=theme.CARD_ICONS.get(key, ""), bg=pal["card"], fg=pal["accent"],
+                            font=theme.font("card_icon"), anchor="w")
+            icon.pack(side="left", padx=(0, self._px(6)))
+            theme.set_roles(icon, background="card", foreground="accent")
+            t = tk.Label(head, text=tr(title), bg=pal["card"], fg=pal["text_muted"], anchor="w",
+                         font=theme.font("card_title", "bold"))
+            t.pack(side="left", fill="x", expand=True)
+            theme.set_roles(t, background="card", foreground="text_muted")
+            v = tk.Label(body, text="—", bg=pal["card"], fg=pal["accent"], anchor="w",
+                         font=theme.font("card_value", "bold"))
+            v.pack(fill="x", pady=(self._px(4), 0))
+            theme.set_roles(v, background="card", foreground="accent")
+            s = tk.Label(body, text="", bg=pal["card"], fg=pal["text_muted"], anchor="w", justify="left",
+                         wraplength=self._px(220))
+            s.pack(fill="x")
+            theme.set_roles(s, background="card", foreground="text_muted")
+            for w in (card, strip, body, head, icon, t, v, s):
+                w.bind("<Button-1>", lambda _e, tg=target: self._card_click(tg))
+                w.bind("<Enter>", lambda _e, k=key: self._card_hover(k, True, _e))
+                w.bind("<Leave>", lambda _e, k=key: self._card_hover(k, False, _e))
+            self._cards[key] = (card, t, v, s)
+            self._card_parts[key] = {"strip": strip, "body": body, "head": head, "icon": icon}
+        self._card_grid = grid
+        self._card_cols = 4
+        try:     # v3.3：窗口窄时卡片自动排成 3 列 / 2 列，数字和说明按卡片宽度换行，中英文都不截断
+            grid.bind("<Configure>", lambda e: self._cards_reflow(getattr(e, "width", 0)), add="+")
+        except Exception:  # noqa
+            pass
+        for c in range(4):
+            try:
+                grid.columnconfigure(c, weight=1, uniform="card")
+            except Exception:  # noqa
+                pass
+        sec = self._section(tab, tr("服务"))
+        tk.Label(sec, textvariable=self.status, anchor="w", justify="left", wraplength=860).pack(fill="x")
+        tk.Label(sec, textvariable=self.sec_var, anchor="w", justify="left", fg="#57606a",
+                 wraplength=860).pack(fill="x", pady=(4, 0))
+        sec = self._section(tab, tr("最近告警（最多 5 条）"))
+        self.ov_alerts = tk.StringVar(value="")
+        tk.Label(sec, textvariable=self.ov_alerts, anchor="w", justify="left", wraplength=860).pack(fill="x")
+        self._render_overview()
+
+    def _cards_reflow(self, width):
+        """总览卡片按内容区宽度排列：每张卡片至少约 190 像素（随 DPI 放大），4 / 3 / 2 列。"""
+        try:
+            width = int(width or 0)
+        except (TypeError, ValueError):
+            width = 0
+        if width < 200 or not self._cards:
+            return self._card_cols
+        cols = ui_layout.card_columns(width, self._px(190))
+        col_w = max(120, width // cols - self._px(12))
+        pad = theme.metrics(self._ui_scale)["card_pad"][0]
+        for i, key in enumerate(self._cards):
+            card, _t, v, sub = self._cards[key]
+            try:
+                if cols != self._card_cols:
+                    card.grid_configure(row=i // cols, column=i % cols)
+                v.configure(wraplength=max(80, col_w - 2 * pad))
+                sub.configure(wraplength=max(80, col_w - 2 * pad))
+            except Exception:  # noqa
+                pass
+        if cols != self._card_cols:
+            for c in range(4):
+                try:
+                    self._card_grid.columnconfigure(c, weight=1 if c < cols else 0, uniform="card" if c < cols else "")
+                except Exception:  # noqa
+                    pass
+        self._card_cols = cols
+        return cols
+
+    def _card_click(self, target):
+        if target == "log":
+            return self._toggle_log_panel(True)
+        if self._nav_click(target) == target and target == "quick":
+            self._select_subtab("quick", "OPC UA 服务")
+        return None
+
+    def _modbus_info(self):
+        fw = self.sa.ALERTS.get("modbus")
+        run = None
+        if fw is not None:
+            try:
+                run = (fw.host, int(fw.port), int(getattr(fw, "requests", 0) or 0))
+            except Exception:  # noqa
+                run = None
+        return {"running": run, "enabled": bool((self.svc.cfg or self.cfg).get("modbus_server_enabled"))}
+
+    def _render_overview(self):
+        if not self._cards:
+            return
+        up = self.svc.is_up()
+        alerts = self._last_alerts if up else {"offline": True}
+        n = None
+        if not (up and alerts.get("channels") is not None):
+            n = len(df.channel_options(self._recs))
+        m = ui_layout.overview_metrics(self._svc_info(), self._recs, alerts, self._sess_res,
+                                       self._modbus_info(), n_channels=n, tr=tr)
+        for key, (_card, _t, v, s) in self._cards.items():
+            val, sub, color = m.get(key, ("—", "", "#57606a"))
+            role = theme.legacy_role(color) or "accent"           # v3.3：状态色换成当前主题里的同一角色
+            try:
+                v.configure(text=val, fg=self._pal[role])
+                theme.set_roles(v, foreground=role)
+                s.configure(text=sub)
+                strip = self._card_parts.get(key, {}).get("strip")
+                if strip is not None:
+                    strip.configure(bg=self._pal[role])
+                    theme.set_roles(strip, background=role)
+            except Exception:  # noqa
+                pass
+        act = list((alerts or {}).get("active") or []) if up else []
+        self.ov_alerts.set("\n".join(tr("[%s] %s（自 %s）") % (x["level"], x["text"], x["since"]) for x in act[:5])
+                           or (tr("[正常] 没有告警") if up else tr("服务未运行")))
+
+    # ---- 各页面顶部 ----
+    def _tools_intro(self, parent):
+        tk = self.tk
+        row = tk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(row, text=tr("快捷诊断"), fg="#1f4e79", font=theme.font(10, "bold")).pack(side="left", padx=(0, 6))
+        for text, cmd in ((tr("智能诊断"), self._gui_diagnose), (tr("数据传输检测"), self._menu_transmission_check),
+                          (tr("发送测试数据"), self._menu_send_test), (tr("485配型诊断"), self._gui_rtu485)):
+            tk.Button(row, text=text, command=cmd).pack(side="left", padx=4)
+
+    def _security_intro(self, parent):
+        tk = self.tk
+        row = tk.Frame(parent)
+        row.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(row, textvariable=self.sec_var, anchor="w", justify="left", fg="#57606a",
+                 wraplength=640).pack(side="left", fill="x", expand=True)
+        tk.Button(row, text=tr("安全设置…"), command=lambda: self._open_security()).pack(side="right", padx=4)
+
+    def _menu_transmission_check(self):
+        return self._gui_transmission(False)
+
+    def _menu_send_test(self):
+        return self._gui_transmission(True)
+
+    # ---- 页面显示时的刷新 ----
+    def _alerts_now(self):
+        self._bg(self.logic.alerts, lambda a, err: None if err is not None else self._render_alerts(a))
+
+    def _users_refresh(self):
+        """“安全与账号”页显示时按配置文件刷新账号列表（创建管理员 / 别处加了账号后不必等下一次读取配置）。"""
+        users = sorted((config_tools.read_raw(self.cfg["_cfg_path"]).get("users") or {}))
+        self.users_lb.delete(0, "end")
+        for u in users:
+            self.users_lb.insert("end", u)
+        if not users:
+            self.users_lb.insert("end", tr("（无账号）"))
+
+    def _pv_on_show(self):
+        self._pv_update_options()
+        self._pv_draw(force=True)
+
+    # ---- 记住上次页面与窗口大小 ----
+    def _layout_values(self):
+        vals = {"desktop_last_page": ui_layout.normalize_last_page(self.pages.current)}
+        try:
+            state = str(self.root.state())
+        except Exception:  # noqa
+            state = "normal"
+        if state == "normal":            # 最大化 / 最小化时不覆盖上次的正常大小
+            try:
+                g = ui_layout.normalize_geometry(self.root.geometry())
+            except Exception:  # noqa
+                g = ""
+            if g:
+                vals["desktop_geometry"] = g
+        return vals
+
+    def _save_layout(self):
+        try:
+            vals = self._layout_values()
+            raw = config_tools.read_raw(self.cfg["_cfg_path"])
+            changed = {k: v for k, v in vals.items() if raw.get(k) != v}
+            if changed:
+                config_tools.update_settings(self.cfg["_cfg_path"], changed)
+                self.cfg.update(changed)
+            return changed
+        except Exception as e:  # noqa  记不住只是不方便，不能挡住关闭窗口
+            self.sa.get_log().warning("保存窗口布局失败：%s", e)
+            return None
+
+
 def json_short(v, n=160):
     import json
     try:
@@ -1842,18 +3043,22 @@ def json_short(v, n=160):
 
 
 
-class DesktopWindow(V31Mixin):
-    """桌面主窗口：服务控制栏 + 登录栏 + 十四个标签页 + 日志窗（v3.1 起继承 V31Mixin）。
+class DesktopWindow(V33Mixin, V32Mixin, V31Mixin):
+    """桌面主窗口（v3.2）：顶部工具栏（服务启停 + 指示灯、当前用户与角色、锁定、语言、网页设置页）
+    + 左侧分组导航（ui_layout.GROUPS，可折叠，无权限的页面带锁灰显）+ 右侧内容区（页面懒加载）
+    + 底部状态栏与可折叠运行日志。v3.1 起继承 V31Mixin，v3.2 起继承 V32Mixin，v3.3 起继承 V33Mixin（主题 / DPI）。
     start_service=True 时窗口打开后自动启动 OPC UA 服务；服务随窗口关闭而停止。
     minimized=True 时窗口打开后最小化到任务栏（v3.0“启动时最小化”）。"""
 
     def __init__(self, cfg, start_service=True, minimized=False):
         import queue
         import tkinter as tk
-        from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+        from tkinter import filedialog, messagebox, simpledialog, ttk
 
         import server_app as sa
 
+        # v3.3：Button / Entry / Checkbutton / Radiobutton 用 ttk 版本（受主题控制），Treeview 自动斑马纹
+        tk, ttk = _themed_modules(tk, ttk, self._btn_kind_style)
         self.tk, self.ttk, self.mb, self.sd, self.fd = tk, ttk, messagebox, simpledialog, filedialog
         self.sa = sa
         self.cfg = cfg
@@ -1891,89 +3096,55 @@ class DesktopWindow(V31Mixin):
         self._popups = []
         self.minimized = minimized
         self._v31_pre()           # v3.1：语言、登录会话、权限检查（必须在建控件之前）
+        self._v32_pre()           # v3.2：页面懒加载与“只刷新可见页面”（必须在建控件之前）
+        self._v33_pre()           # v3.3：主题设置、DPI 感知（必须在创建 Tk 之前）
 
         sa._hide_own_console()
         root = tk.Tk()
         self.root = root
         root.title(tr("色谱提取 OPC UA 服务 v%s") % sa.__version__)
         sa._set_window_icon(root)
-        root.geometry("1180x800")
         try:
-            ttk.Style().configure("TNotebook.Tab", padding=(6, 2))
+            sw, sh = int(root.winfo_screenwidth()), int(root.winfo_screenheight())
         except Exception:  # noqa
-            pass
+            sw = sh = None
+        # v3.3：高 DPI（tk scaling）、字体、主题（ttk 样式以 clam 为底 + 选项数据库），都在建控件之前
+        self._setup_dpi(root)
+        self._setup_fonts(root)
+        self._apply_theme(initial=True)
+        # v3.2：默认 1100x720、最小 900x600；记住上次的大小和位置（desktop_geometry）
+        # v3.3：高 DPI 下默认 / 最小尺寸按缩放放大（逻辑尺寸不变），且不超过屏幕
+        scr = (sw, sh) if sw and sh else None
+        if ui_layout.normalize_geometry(cfg.get("desktop_geometry")):
+            geo = ui_layout.restore_geometry(cfg.get("desktop_geometry"), sw, sh)
+        else:
+            geo = ui_layout.format_geometry(*theme.scale_size(ui_layout.DEFAULT_SIZE, self._ui_scale, scr))
+        root.geometry(geo)
+        root.minsize(*theme.scale_size(ui_layout.MIN_SIZE, self._ui_scale, scr))
         self._build_menu(root)
-        root.minsize(900, 620)
 
-        # 顶部：服务状态 + 服务控制按钮（v2.9：桌面里直接启停服务）
+        # 多个页面共用的文字变量（页面懒加载，所以在建页面之前就建好）
         self.status = tk.StringVar(value=tr("服务未运行"))
-        self.status_lbl = tk.Label(root, textvariable=self.status, anchor="w", fg="#57606a",
-                                   font=("Microsoft YaHei", 11, "bold"))
-        self.status_lbl.pack(fill="x", padx=10, pady=(8, 2))
-        ctl = tk.Frame(root)
-        ctl.pack(fill="x", padx=10, pady=(0, 2))
-        self.btn_start = tk.Button(ctl, text=tr("▶ 启动服务"), width=11, command=self._start_service)
-        self.btn_start.pack(side="left", padx=(0, 4))
-        self.btn_stop = tk.Button(ctl, text=tr("■ 停止服务"), width=11, command=self._stop_service)
-        self.btn_stop.pack(side="left", padx=4)
-        self.btn_restart = tk.Button(ctl, text=tr("重启服务"), command=self._restart_service)
-        self.btn_restart.pack(side="left", padx=4)
-        self.btn_selftest = tk.Button(ctl, text=tr("自检"), command=self._selftest)
-        self.btn_selftest.pack(side="left", padx=(16, 4))
-        tk.Button(ctl, text=tr("打开网页设置页"), command=self._open_web).pack(side="left", padx=4)
-        tk.Button(ctl, text=tr("打开日志文件夹"), command=self._open_logs).pack(side="left", padx=4)
-
         self.sec_var = tk.StringVar(value=sa.security_summary(cfg))
-        bar = tk.Frame(root)
-        bar.pack(fill="x", padx=10)
-        tk.Label(bar, textvariable=self.sec_var, anchor="w").pack(side="left")
-        for text, cmd in ((tr("安全设置…"), self._open_security), (tr("485配型诊断"), self._gui_rtu485),
-                          (tr("发送测试数据"), lambda: self._gui_transmission(True)),
-                          (tr("数据传输检测"), lambda: self._gui_transmission(False)),
-                          (tr("智能诊断"), self._gui_diagnose)):
-            tk.Button(bar, text=text, command=cmd).pack(side="right", padx=4)
-        self._build_login_bar(root)
-
-        nb = ttk.Notebook(root)
-        nb.pack(fill="both", expand=True, padx=10, pady=6)
-        self.nb = nb
-        self._build_status_tab(nb)
-        self._build_channels_tab(nb)      # v3.0
-        self._build_preview_tab(nb)       # v3.0（v3.1 加峰表）
-        self._build_history_tab(nb)       # v3.1
-        self._build_clients_tab(nb)       # v3.0
-        self._build_data_tab(nb)
-        self._build_reports_tab(nb)       # v3.1
-        self._build_alerts_tab(nb)
-        self._build_tools_tab(nb)
-        self._build_comm_tab(nb)          # v3.0 通讯诊断
-        self._build_modbus_tab(nb)        # v3.1
-        self._build_quick_tab(nb)         # v3.0（v3.1 加界面语言）
-        self._build_system_tab(nb)
-        self._build_backup_tab(nb)        # v3.1 备份与还原 / 账号与角色 / 审计
-
-        # 底部保存栏（与网页版 savebar 对应）
-        savebar = tk.Frame(root)
-        savebar.pack(fill="x", padx=10, pady=(0, 4))
+        self.rec_note = tk.StringVar(value=tr("正在读取……"))
+        self.pv_note = tk.StringVar(value="")
         self.dirty_txt = tk.StringVar(value=tr("没有未保存的修改"))
-        tk.Label(savebar, textvariable=self.dirty_txt, anchor="w").pack(side="left")
-        tk.Button(savebar, text=tr("放弃修改"), command=self._reload).pack(side="right", padx=4)
-        tk.Button(savebar, text=tr("保存设置"), command=self._save).pack(side="right", padx=4)
 
-        # 日志窗（运行日志实时显示；完整日志在 logs\server.log）
-        logbar = tk.Frame(root)
-        logbar.pack(fill="x", padx=10)
-        tk.Label(logbar, text=tr("运行日志"), anchor="w", fg="#555").pack(side="left")
-        tk.Button(logbar, text=tr("清空显示"), command=self._clear_log).pack(side="right", padx=2)
-        tk.Button(logbar, text=tr("打开日志文件"), command=self._open_log_file).pack(side="right", padx=2)
-        self.box = scrolledtext.ScrolledText(root, height=8, state="disabled")
-        self.box.pack(fill="both", padx=10, pady=(2, 8))
+        # v3.2 布局：顶部工具栏 / 底部状态栏 + 可折叠日志 / 左侧分组导航 + 右侧内容区
+        self._build_toolbar(root)
+        self._build_statusbar(root)
+        self._build_log_panel(root)
+        self._build_body(root)
+        self._theme_paint(root, "bg")     # v3.3：工具栏、导航、状态栏等按主题着色（页面在建好时各自着色）
 
         self._setup_logging()
+        self._render_user()
+        # 打开上次的页面（不存在或当前身份没有权限时回退总览）；其它页面第一次点开时才建
+        self._show_page(ui_layout.resolve_start_page(cfg.get("desktop_last_page"), self.session.can))
         self._reload()
         self._pump_log()
         self._poll_queue()
-        self._refresh_sec()
+        self._refresh_sec(True)
         self._poll_alerts()
         self._poll_probes()
         self._poll_stability()
@@ -1983,7 +3154,6 @@ class DesktopWindow(V31Mixin):
         self._poll_sessions()
         self._poll_idle()
         self._poll_reports()
-        self._render_user()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         if start_service:      # 打开窗口自动启动服务是程序行为，不需要登录
             root.after(200, self._unguarded("_start_service"))
@@ -2029,6 +3199,9 @@ class DesktopWindow(V31Mixin):
         self.box.configure(state="normal")
         self.box.delete("1.0", "end")
         self.box.configure(state="disabled")
+        self._log_lines = 0
+        self._log_new = 0
+        self._update_log_toggle()
 
     # ---- 服务控制（v2.9）----
     def _fresh_cfg(self):
@@ -2047,11 +3220,9 @@ class DesktopWindow(V31Mixin):
         self.btn_start.configure(state="disabled" if (running or busy or not allowed) else "normal")
         self.btn_stop.configure(state="normal" if (running and not busy and allowed) else "disabled")
         self.btn_restart.configure(state="normal" if (running and not busy and allowed) else "disabled")
-        self.btn_selftest.configure(state="disabled" if busy else "normal")
 
-    def _poll_service(self):
-        if self._closed:
-            return
+    def _poll_service_text(self):
+        """顶部指示灯 + 简短状态、总览里的完整状态、底部状态栏、总览卡片（v3.2）。"""
         up = self.svc.is_up()
         if self._busy:
             text, color = self._busy, "#9a6700"
@@ -2059,7 +3230,25 @@ class DesktopWindow(V31Mixin):
             text, color = service_status_text(self.svc.running(), up, self.svc.error,
                                               (self.svc.cfg or self.cfg).get("endpoint"))
         self.status.set(text)
-        self.status_lbl.configure(fg=color)
+        _k, short, dot = ui_layout.service_state(self.svc.running(), up, self.svc.error, self._busy)
+        self.status_short.set(short if self._busy else tr(short))
+        try:   # v3.3：绿 / 黄 / 红 / 灰指示灯换成当前主题里的成功 / 警告 / 严重 / 次要色
+            dot_role = theme.legacy_role(dot) or "text_muted"
+            txt_role = theme.legacy_role(color) or "text_muted"
+            self.status_dot.configure(fg=self._pal[dot_role])
+            self.status_lbl.configure(fg=self._pal[txt_role])
+            theme.set_roles(self.status_dot, foreground=dot_role)
+            theme.set_roles(self.status_lbl, foreground=txt_role)
+        except Exception:  # noqa
+            pass
+        self._update_statusbar()
+        self._render_overview()
+        return up
+
+    def _poll_service(self):
+        if self._closed:
+            return
+        up = self._poll_service_text()
         self._set_service_buttons()
         if up and not self._was_up:      # 刚启动成功：立即刷新告警/环境检测/通道数据
             self._poll_env()
@@ -2077,7 +3266,7 @@ class DesktopWindow(V31Mixin):
             cfg = self._fresh_cfg()
         except Exception as e:  # noqa  配置有误：不启动，告诉用户哪里错
             self.svc.error = tr("配置有误")
-            return self._show(False, tr("配置有误，服务没有启动：\n%s\n\n请在“系统设置”里改正并保存后再启动。") % e)
+            return self._show(False, tr("配置有误，服务没有启动：\n%s\n\n请到相应的设置页（多数在“系统 › 常用设置”）改正并保存后再启动。") % e)
         self.cfg = cfg
         for w in self.sa.watch_dir_warnings(cfg):
             self.sa.get_log().warning("数据目录提示：%s", w)
@@ -2139,7 +3328,7 @@ class DesktopWindow(V31Mixin):
     def _open_web(self):
         import webbrowser
         if not self.cfg.get("web_ui", True):
-            return self._show(False, tr("网页设置页已关闭：在“系统设置 → 高级设置”勾选“启用设置网页”并保存后再试。"))
+            return self._show(False, tr("网页设置页已关闭：在“系统 › 常用设置 → 高级设置”勾选“启用设置网页”并保存后再试。"))
 
         def done(web, err):
             if err is not None or web is None:
@@ -2160,6 +3349,7 @@ class DesktopWindow(V31Mixin):
             if not self.mb.askyesno(tr("退出"), tr("关闭窗口会停止 OPC UA 服务，DCS/SCADA 将读不到数据。\n确定退出吗？"),
                                     parent=self.root):
                 return
+        self._save_layout()       # v3.2：记住当前页面和窗口大小（desktop_last_page / desktop_geometry）
         self._closed = True
         try:
             self.logic.stop_stability()
@@ -2194,9 +3384,16 @@ class DesktopWindow(V31Mixin):
             while True:
                 rec = self.sa.log_q.get_nowait()
                 self.box.configure(state="normal")
-                self.box.insert("end", rec + "\n")
+                self.box.insert("end", rec + "\n", ("log_" + theme.log_level(rec),))
+                self._log_lines += 1
+                if self._log_lines > 3000:          # v3.2：日志窗只留最近约 2000 行，避免越来越卡
+                    self.box.delete("1.0", "1001.0")
+                    self._log_lines -= 1000
                 self.box.see("end")
                 self.box.configure(state="disabled")
+                if not self._log_open and ("[WARNING]" in rec or "[ERROR]" in rec or "[CRITICAL]" in rec):
+                    self._log_new += 1
+                    self._update_log_toggle()
         except _queue.Empty:
             pass
         if not self._closed:
@@ -2247,16 +3444,25 @@ class DesktopWindow(V31Mixin):
 
     def _section(self, parent, title):
         tk = self.tk
-        frame = tk.LabelFrame(parent, text=title, font=("Microsoft YaHei", 11, "bold"),
-                              fg="#1f4e79", padx=10, pady=8)
-        frame.pack(fill="x", padx=6, pady=6)
+        # v3.3：区域 = 白底（深色主题为深灰）卡片 + 1 像素边框，标题主色加粗；子控件自动继承卡片底色
+        frame = tk.LabelFrame(parent, text=title, font=theme.font("section", "bold"), fg="#1f4e79",
+                              padx=self._px(12), pady=self._px(8), bd=0, relief="flat", highlightthickness=1)
+        theme.set_roles(frame, background="surface", foreground="accent", highlightbackground="border",
+                        highlightcolor="border")
+        try:
+            frame.configure(bg=self._pal["surface"], highlightbackground=self._pal["border"],
+                            highlightcolor=self._pal["border"], fg=self._pal["accent"])
+        except Exception:  # noqa
+            pass
+        frame.pack(fill="x", padx=self._px(8), pady=self._px(6))
         return frame
 
     def _row(self, parent, label, widget_maker, hint=""):
         tk = self.tk
         row = tk.Frame(parent)
         row.pack(fill="x", pady=3)
-        tk.Label(row, text=label, width=26, anchor="w").pack(side="left")
+        tk.Label(row, text=label, width=26, anchor="w", justify="left",
+                 wraplength=180).pack(side="left")     # v3.2：英文标签较长时换行，不截断
         widget = widget_maker(row)
         widget.pack(side="left", fill="x", expand=True)
         if hint:
@@ -2307,8 +3513,10 @@ class DesktopWindow(V31Mixin):
                 values[key] = var.get()
         return values
 
-    def _set_values(self, cfg):
+    def _set_values(self, cfg, keys=None):
         for key, (var, w, kind) in self._vars.items():
+            if keys is not None and key not in keys:      # v3.2：新打开的页面只填它自己的字段
+                continue
             if kind == "bool":
                 var.set(bool(cfg.get(key)))
             elif kind == "select":
@@ -2349,12 +3557,28 @@ class DesktopWindow(V31Mixin):
         self._bg(self.logic.state, done)
 
     def _render_state(self, st):
+        """把读到的配置填进各页面。v3.2：页面懒加载，各页面的部分拆成单独的渲染方法，
+        页面还没打开时只记下参数，第一次打开时再填（见 ui_layout.RENDER_GUARDS）。"""
         self._orig = st["config"]
         self._set_values(st["config"])
         self._mark_dirty()
         self._render_data_dirs(st["config"].get("watch_dirs"))
+        self._render_export_state(st["config"])
+        self._render_security_state(st)
+        self._render_alerts_state(st["config"])
+        self._qs_set(st["config"])
+        self._render_alerts(st.get("alerts") or {})
+
+    def _render_export_state(self, cfg):
         if not self.exp_dir.get().strip():
-            self.exp_dir.set(default_export_dir(st["config"], self.cfg["_base_dir"]))
+            self.exp_dir.set(default_export_dir(cfg, self.cfg["_base_dir"]))
+
+    def _render_alerts_state(self, cfg):
+        self.smtp_pw_state.set(tr("密码已加密保存在配置文件里。QQ/163/企业邮箱请填“授权码”。")
+                               if cfg.get("smtp_password_set")
+                               else tr("QQ/163/企业邮箱请填“授权码”，不是网页登录密码。"))
+
+    def _render_security_state(self, st):
         # 安全体检
         lines = []
         if st.get("error"):
@@ -2362,16 +3586,11 @@ class DesktopWindow(V31Mixin):
         lines += ["[%s] %s" % (r["level"], r["text"]) for r in st.get("report", [])]
         self._set_text(self.report_text, "\n".join(lines))
         self.cfg_path_var.set(tr("配置文件：%s") % st.get("cfg_path", ""))
-        self.smtp_pw_state.set(tr("密码已加密保存在配置文件里。QQ/163/企业邮箱请填“授权码”。")
-                               if st["config"].get("smtp_password_set")
-                               else tr("QQ/163/企业邮箱请填“授权码”，不是网页登录密码。"))
-        self._qs_set(st["config"])
         self.users_lb.delete(0, "end")
         for u in st["config"].get("users") or []:
             self.users_lb.insert("end", u)
         if not st["config"].get("users"):
             self.users_lb.insert("end", tr("（无账号）"))
-        self._render_alerts(st.get("alerts") or {})
 
     def _set_text(self, widget, text):
         widget.configure(state="normal")
@@ -2379,7 +3598,11 @@ class DesktopWindow(V31Mixin):
         widget.insert("end", text)
         widget.configure(state="disabled")
 
-    def _refresh_sec(self):
+    def _refresh_sec(self, _sched=False):
+        if _sched and not self.pages.any_visible(ui_layout.POLL_PAGES["security"]):
+            if not self._closed:                   # v3.2：显示它的页面（总览 / 安全与账号）不可见时不算
+                self.root.after(5000, lambda: self._refresh_sec(True))
+            return
         try:
             text = self.sa.security_summary(self.cfg)
             mon = self.sa.ALERTS.get("monitor")
@@ -2391,8 +3614,8 @@ class DesktopWindow(V31Mixin):
             self.sec_var.set(text)
         except Exception:  # noqa
             pass
-        if not self._closed:
-            self.root.after(5000, self._refresh_sec)
+        if _sched and not self._closed:
+            self.root.after(5000, lambda: self._refresh_sec(True))
 
     # ---- 原图形窗口的快捷功能 ----
     def _open_security(self):
@@ -2461,13 +3684,9 @@ class DesktopWindow(V31Mixin):
         self._bg(work)
 
     # ---- 标签页 2：数据与导出（v2.9 新增）----
-    def _build_data_tab(self, nb):
+    def _sec_data_dirs(self, inner):
+        """v3.1「数据与导出」页的「数据目录」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
         tk, ttk = self.tk, self.ttk
-        from tkinter import scrolledtext
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("数据与导出"))
-        inner = _scrollable(tab, tk, ttk)
-
         sec = self._section(inner, tr("数据目录"))
         tk.Label(sec, text=tr("存放 *_V3.db / *.mbd 的文件夹（色谱工作站 DataBrowser 的数据目录）。选择后立即保存；"
                            "服务运行中会在下一轮扫描（默认 30 秒内）自动生效，无需重启。"),
@@ -2481,9 +3700,12 @@ class DesktopWindow(V31Mixin):
         tk.Button(row, text=tr("添加目录…"), command=lambda: self._pick_data_dir(replace=False)).pack(side="left", padx=4)
         tk.Button(row, text=tr("打开数据目录"), command=self._open_data_dir).pack(side="left", padx=4)
         tk.Button(row, text=tr("查看数据源"), command=self._list_sources).pack(side="left", padx=(16, 4))
-        self.src_out = scrolledtext.ScrolledText(sec, height=10, state="disabled", wrap="none")
+        self.src_out = self._scrolled_text(sec, height=10, state="disabled", wrap="none")
         self.src_out.pack(fill="x", pady=4)
 
+    def _sec_export_csv(self, inner):
+        """v3.1「数据与导出」页的「导出 CSV」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("导出 CSV"))
         tk.Label(sec, text=tr("把数据目录里的谱图导出为 CSV：index.csv（总清单）+ csv\\（每条谱图一个文件：时间、原始计数、"
                            "微伏、显示值）。每次导出放在带时间的子文件夹里，不覆盖上次结果。读取的是数据库副本，"
@@ -2506,7 +3728,7 @@ class DesktopWindow(V31Mixin):
         self.exp_btn = tk.Button(row, text=tr("开始导出"), command=self._export_csv)
         self.exp_btn.pack(side="left")
         tk.Button(row, text=tr("打开导出文件夹"), command=self._open_export_dir).pack(side="left", padx=8)
-        self.exp_out = scrolledtext.ScrolledText(sec, height=8, state="disabled", wrap="word")
+        self.exp_out = self._scrolled_text(sec, height=8, state="disabled", wrap="word")
         self.exp_out.pack(fill="x", pady=4)
         self._last_export = ""
 
@@ -2606,28 +3828,27 @@ class DesktopWindow(V31Mixin):
         self._open_path(d)
 
     # ---- 标签页 1：运行状态 ----
-    def _build_status_tab(self, nb):
+    def _sec_run_alerts(self, inner):
+        """v3.1「运行状态」页的「运行告警」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
         tk, ttk = self.tk, self.ttk
-        from tkinter import scrolledtext
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("运行状态"))
-        inner = _scrollable(tab, tk, ttk)
-
         sec = self._section(inner, tr("运行告警"))
         self.al_sum = tk.StringVar(value="")
         tk.Label(sec, textvariable=self.al_sum, anchor="w", fg="#666").pack(fill="x")
         self.al_quiet = tk.StringVar(value="")
         tk.Label(sec, textvariable=self.al_quiet, anchor="w", fg="#856404").pack(fill="x")
-        self.al_active = scrolledtext.ScrolledText(sec, height=5, state="disabled", wrap="word")
+        self.al_active = self._scrolled_text(sec, height=5, state="disabled", wrap="word")
         self.al_active.pack(fill="x", pady=4)
         tk.Label(sec, text=tr("最近的告警记录"), anchor="w").pack(fill="x")
-        self.al_hist = scrolledtext.ScrolledText(sec, height=5, state="disabled", wrap="word")
+        self.al_hist = self._scrolled_text(sec, height=5, state="disabled", wrap="word")
         self.al_hist.pack(fill="x", pady=4)
 
+    def _sec_probes(self, inner):
+        """v3.1「运行状态」页的「设备检测」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("设备检测"))
         tk.Label(sec, text=tr("服务运行时按间隔自动检测关键设备（DCS、网关、分析仪等），连续失败达到次数就告警，"
-                           "一次成功自动恢复；告警走告警与通知页设置的群机器人 / 邮件，遵守静默时段和渠道级别。"
-                           "添加方法：在“诊断工具”的连接测试里选好类型和参数、测通后，点“加为设备检测”。"),
+                           "一次成功自动恢复；告警走“告警 → 通知设置”里的群机器人 / 邮件，遵守静默时段和渠道级别。"
+                           "添加方法：在“通讯 › 驱动 / 连接测试”的连接测试里选好类型和参数、测通后，点“加为设备检测”。"),
                  fg="#777", anchor="w", justify="left", wraplength=860).pack(fill="x")
         self.pr_sum = tk.StringVar(value="")
         tk.Label(sec, textvariable=self.pr_sum, anchor="w", fg="#666").pack(fill="x")
@@ -2645,6 +3866,9 @@ class DesktopWindow(V31Mixin):
                           (tr("刷新"), self._poll_probes_now)):
             tk.Button(btns, text=text, command=cmd).pack(side="left", padx=4)
 
+    def _sec_channel_rules(self, inner):
+        """v3.1「运行状态」页的「通道告警设置」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("通道告警设置"))
         tk.Label(sec, text=tr("长期停用或检修中的流路可以屏蔽告警；轮换间隔长的流路可以单独加大“无新周期”分钟数。"
                            "屏蔽时该通道的告警直接移除，不发“恢复”；可设到期时间自动解除。选中一行点“编辑规则”修改。"),
@@ -2719,7 +3943,7 @@ class DesktopWindow(V31Mixin):
         win = tk.Toplevel(self.root)
         win.title(tr("通道告警规则"))
         win.geometry("460x280")
-        tk.Label(win, text=c["label"], font=("Microsoft YaHei", 11, "bold"), anchor="w").pack(
+        tk.Label(win, text=c["label"], font=theme.font(11, "bold"), anchor="w").pack(
             fill="x", padx=12, pady=(10, 4))
         mute = tk.BooleanVar(value=bool(c.get("muted")))
         tk.Checkbutton(win, text=tr("屏蔽该通道的告警"), variable=mute).pack(anchor="w", padx=12)
@@ -2738,13 +3962,15 @@ class DesktopWindow(V31Mixin):
             win.destroy()
             self._do_action("channel_rule", body)
         tk.Button(win, text=tr("保存"), command=save).pack(pady=12)
+        self._theme_paint(win, "bg")            # v3.3：对话框按当前主题着色
 
     # ---- 设备检测（状态页表格）----
     def _poll_probes_now(self):
         self._bg(self.logic.probes, lambda r, e: None if e else self._render_probes(r))
 
     def _poll_probes(self):
-        self._poll_probes_now()
+        if self.pages.any_visible(ui_layout.POLL_PAGES["probes"]):    # v3.2：只在“告警”页可见时取
+            self._poll_probes_now()
         if not self._closed:
             self.root.after(10000, self._poll_probes)
 
@@ -2797,7 +4023,8 @@ class DesktopWindow(V31Mixin):
         p = self._pr_selected()
         if p is None:
             return
-        self.nb.select(2)     # 跳到诊断工具页
+        self._show_page("tools")      # v3.2：跳到“通讯 › 驱动 / 连接测试 → 连接测试”
+        self._select_subtab("tools", "连接测试")
         self._nt_show(p["kind"])
         for k, v in (p.get("params") or {}).items():
             if k in self._nt_vars:
@@ -2827,12 +4054,9 @@ class DesktopWindow(V31Mixin):
             self.root.after(600, self._poll_probes_now)
 
     # ---- 标签页 2：告警与通知 ----
-    def _build_alerts_tab(self, nb):
+    def _sec_alert_settings(self, inner):
+        """v3.1「告警与通知」页的「告警设置」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
         tk, ttk = self.tk, self.ttk
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("告警与通知"))
-        inner = _scrollable(tab, tk, ttk)
-
         sec = self._section(inner, tr("告警设置"))
         self._field(sec, "alert_stale_minutes", tr("通道无新周期告警（分钟）"),
                     tr("超过这么久没有新周期就告警（分析仪停机、数据库不再更新）；按分析周期设，例如周期 10 分钟可设 60；0 = 不检查"), "num")
@@ -2843,6 +4067,9 @@ class DesktopWindow(V31Mixin):
                     SELECT_OPTIONS["alert_webhook_level"])
         tk.Button(sec, text=tr("发送测试消息"), command=lambda: self._do_action("test_webhook")).pack(anchor="w", pady=4)
 
+    def _sec_quiet(self, inner):
+        """v3.1「告警与通知」页的「静默时段（计划停机 / 检修时不推送）」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("静默时段（计划停机 / 检修时不推送）"))
         tk.Label(sec, text=tr("静默期间群机器人和邮件都不发；日志、本窗口和 OPC UA 告警节点照常显示。"
                            "静默结束时仍未恢复的告警会补发一次；静默期间出现又恢复的不再打扰。"
@@ -2886,6 +4113,9 @@ class DesktopWindow(V31Mixin):
         tk.Label(sec, text=tr("开始/结束填 HH:MM；结束早于开始表示跨午夜，例如 22:00～06:00"),
                  fg="#777", anchor="w").pack(fill="x", padx=(190, 0))
 
+    def _sec_email(self, inner):
+        """v3.1「告警与通知」页的「邮件通知（可选）」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("邮件通知（可选）"))
         self._field(sec, "alert_email_to", tr("收件人"),
                     tr("多个用逗号隔开；留空 = 不发邮件。告警出现和恢复时各发一封，每小时最多 20 封"), "str")
@@ -2947,13 +4177,9 @@ class DesktopWindow(V31Mixin):
             self._do_action("set_smtp_password", {"password": ""})
 
     # ---- 标签页 3：诊断工具 ----
-    def _build_tools_tab(self, nb):
+    def _sec_env(self, inner):
+        """v3.1「诊断工具」页的「驱动与软件环境检测」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
         tk, ttk = self.tk, self.ttk
-        from tkinter import scrolledtext
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("诊断工具"))
-        inner = _scrollable(tab, tk, ttk)
-
         sec = self._section(inner, tr("驱动与软件环境检测"))
         tk.Label(sec, text=tr("只读检查，不会安装或修改任何东西：串口设备和驱动（CH340 / FTDI / CP210x / PL2303 等，"
                            "含黄色感叹号设备）、运行库、防火墙服务、OPC UA 端口、数据目录、旧版本遗留的后台自启。"
@@ -2971,9 +4197,12 @@ class DesktopWindow(V31Mixin):
         self.dc_btn.pack(side="left")
         self.dc_time = tk.StringVar(value="")
         tk.Label(row, textvariable=self.dc_time, fg="#777").pack(side="left", padx=8)
-        self.dc_out = scrolledtext.ScrolledText(sec, height=8, state="disabled", wrap="word")
+        self.dc_out = self._scrolled_text(sec, height=8, state="disabled", wrap="word")
         self.dc_out.pack(fill="x", pady=4)
 
+    def _sec_conn_test(self, inner):
+        """v3.1「诊断工具」页的「连接测试」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("连接测试"))
         tk.Label(sec, text=tr("现场排查用：网络（Ping / TCP 端口 / DNS / OPC UA / Modbus TCP）和串口"
                            "（RS-232 / RS-485 / RS-422，Modbus RTU）。测试在本机执行。"),
@@ -2982,7 +4211,8 @@ class DesktopWindow(V31Mixin):
         kind_row.pack(fill="x", pady=4)
         self._nt_kind_btns = {}
         for kind, spec in NETTEST_SPECS.items():
-            b = tk.Button(kind_row, text=tr(spec["t"]), command=lambda k=kind: self._nt_show(k))
+            b = tk.Button(kind_row, text=tr(spec["t"]), command=lambda k=kind: self._nt_show(k),
+                          style=theme.STYLE["toggle"])
             b.pack(side="left", padx=2, pady=2)
             self._nt_kind_btns[kind] = b
         self.nt_tip = tk.StringVar(value="")
@@ -2997,7 +4227,7 @@ class DesktopWindow(V31Mixin):
         tk.Label(row, textvariable=self.nt_time, fg="#777").pack(side="left", padx=8)
         row = tk.Frame(sec)
         row.pack(fill="x", pady=2)
-        tk.Label(row, text=tr("加为设备检测："), font=("Microsoft YaHei", 10, "bold")).pack(side="left")
+        tk.Label(row, text=tr("加为设备检测："), font=theme.font(10, "bold")).pack(side="left")
         self.pr_label, self.pr_iv, self.pr_thr, self.pr_lv = (tk.StringVar(), tk.StringVar(value="60"),
                                                               tk.StringVar(value="3"), tk.StringVar(value=tr("警告")))
         tk.Label(row, text=tr("名称")).pack(side="left", padx=(6, 2))
@@ -3009,12 +4239,16 @@ class DesktopWindow(V31Mixin):
         tk.Label(row, text=tr("次告警")).pack(side="left", padx=2)
         ttk.Combobox(row, textvariable=self.pr_lv, values=[tr("警告"), tr("严重")], state="readonly", width=7).pack(side="left")
         tk.Button(row, text=tr("加为设备检测"), command=self._pr_add).pack(side="left", padx=6)
-        self.nt_out = scrolledtext.ScrolledText(sec, height=7, state="disabled", wrap="word")
+        self.nt_out = self._scrolled_text(sec, height=7, state="disabled", wrap="word")
         self.nt_out.pack(fill="x", pady=4)
 
         # ---- Modbus Poll 主站测试（v2.8） ----
         self._mbp_polling = False
         self._mbp_stop = None
+
+    def _sec_modbus_poll(self, inner):
+        """v3.1「诊断工具」页的「Modbus Poll 主站测试」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("Modbus Poll 主站测试"))
         tk.Label(sec, text=tr("像 Modbus Poll 一样读/写设备数据：TCP 或 RTU，读 01/02/03/04，"
                            "写 05/06/15/16（写之前会弹窗确认目标和数值）。寄存器按数据类型+字节序解码显示，"
@@ -3084,7 +4318,7 @@ class DesktopWindow(V31Mixin):
         self.mbp_poll_btn = tk.Button(row, text=tr("开始轮询"), command=self._mbp_toggle_poll)
         self.mbp_poll_btn.pack(side="left", padx=6)
         tk.Button(row, text=tr("写入（确认后执行）"), command=self._mbp_once).pack(side="left")
-        self.mbp_out = scrolledtext.ScrolledText(sec, height=8, state="disabled", wrap="word")
+        self.mbp_out = self._scrolled_text(sec, height=8, state="disabled", wrap="word")
         self.mbp_out.pack(fill="x", pady=4)
 
         # ---- Modbus Slave 从站模拟器（v2.8） ----
@@ -3092,6 +4326,10 @@ class DesktopWindow(V31Mixin):
         self._mbs_store = None
         self._mbs_logs = []
         self._mbs_log_idx = 0
+
+    def _sec_modbus_slave(self, inner):
+        """v3.1「诊断工具」页的「Modbus Slave 从站模拟器」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("Modbus Slave 从站模拟器"))
         tk.Label(sec, text=tr("像 Modbus Slave 一样模拟一台从站设备：TCP 或 RTU，四区数据"
                            "（线圈 / 离散输入 / 保持寄存器 / 输入寄存器）可编辑，带通讯日志。"
@@ -3158,12 +4396,15 @@ class DesktopWindow(V31Mixin):
         ttk.Combobox(row, textvariable=self.mbs_order, values=MODBUS_ORDERS,
                      state="readonly", width=7).pack(side="left", padx=(2, 8))
         tk.Button(row, text=tr("写入数据区"), command=self._mbs_write_area).pack(side="left")
-        self.mbs_area_out = scrolledtext.ScrolledText(sec, height=5, state="disabled", wrap="word")
+        self.mbs_area_out = self._scrolled_text(sec, height=5, state="disabled", wrap="word")
         self.mbs_area_out.pack(fill="x", pady=4)
-        tk.Label(sec, text=tr("通讯日志"), font=("Microsoft YaHei", 10, "bold")).pack(anchor="w")
-        self.mbs_log = scrolledtext.ScrolledText(sec, height=7, state="disabled", wrap="word")
+        tk.Label(sec, text=tr("通讯日志"), font=theme.font(10, "bold")).pack(anchor="w")
+        self.mbs_log = self._scrolled_text(sec, height=7, state="disabled", wrap="word")
         self.mbs_log.pack(fill="x", pady=4)
 
+    def _sec_stability(self, inner):
+        """v3.1「诊断工具」页的「长时间稳定性测试」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("长时间稳定性测试"))
         tk.Label(sec, text=tr("用上面同样的参数反复测试，统计丢包率、延迟和错误。支持 Ping / TCP 端口 / DNS / OPC UA / "
                            "Modbus TCP / Modbus RTU / 串口收发；测试期间请保持窗口打开（关闭窗口会停止测试）。"),
@@ -3192,9 +4433,10 @@ class DesktopWindow(V31Mixin):
         tk.Button(row, text=tr("清空列表"), command=self._mt_clear).pack(side="left", padx=4)
         self.mt_lb = tk.Listbox(sec, height=4, exportselection=False)
         self.mt_lb.pack(fill="x", pady=4)
-        self.st_view = scrolledtext.ScrolledText(sec, height=10, state="disabled", wrap="word")
+        self.st_view = self._scrolled_text(sec, height=10, state="disabled", wrap="word")
         self.st_view.pack(fill="x", pady=4)
         self.st_canvas = tk.Canvas(sec, height=150, bg="#fafbfc", highlightthickness=1, highlightbackground="#eee")
+        theme.set_roles(self.st_canvas, background="chart_bg", highlightbackground="border", highlightcolor="border")
         self.st_canvas.pack(fill="x", pady=4)
         row = tk.Frame(sec)
         row.pack(fill="x")
@@ -3209,7 +4451,7 @@ class DesktopWindow(V31Mixin):
         tk, ttk = self.tk, self.ttk
         self._nt_kind = kind
         for k, b in self._nt_kind_btns.items():
-            b.configure(relief="sunken" if k == kind else "raised")
+            b.configure(style=theme.STYLE["toggle_on" if k == kind else "toggle"])   # v3.3：选中的类型高亮
         self.nt_tip.set(tr(NETTEST_SPECS[kind].get("tip", "")))
         for child in self.nt_form.winfo_children():
             child.destroy()
@@ -3569,21 +4811,27 @@ class DesktopWindow(V31Mixin):
         def done(e, err):
             if err is not None or not e:
                 if not e:
-                    self.env_last.set(tr("服务未运行：自动检测只在服务运行时进行，可以点“开始检测”手动检查。"))
+                    self._env_note(tr("服务未运行：自动检测只在服务运行时进行，可以点“开始检测”手动检查。"))
                 return
             if e.get("running") and not e.get("result"):
-                self.env_last.set(tr("正在进行启动检测…"))
+                self._env_note(tr("正在进行启动检测…"))
                 self.root.after(3000, self._poll_env)
                 return
             if not e.get("result"):
-                self.env_last.set(tr("启动检测还没开始（服务启动约 8 秒后进行，或已在设置里关闭）。"))
+                self._env_note(tr("启动检测还没开始（服务启动约 8 秒后进行，或已在设置里关闭）。"))
                 self.root.after(5000, self._poll_env)
                 return
-            self.env_last.set(tr("上次自动检测：%s · %s") % (e["time"], e["result"]["summary"]))
-            if self._dc_shown_time != e["time"] and not self.dc_out.get("1.0", "end").strip():
-                self._dc_show(e["result"], e["time"])
-            self._dc_shown_time = e["time"]
+            self._env_note(tr("上次自动检测：%s · %s") % (e["time"], e["result"]["summary"]))
+            self._env_result(e)
         self._bg(self.logic.env, done)
+
+    def _env_note(self, text):
+        self.env_last.set(text)
+
+    def _env_result(self, e):
+        if self._dc_shown_time != e["time"] and not self.dc_out.get("1.0", "end").strip():
+            self._dc_show(e["result"], e["time"])
+        self._dc_shown_time = e["time"]
 
     # ---- 稳定性测试 ----
     _ST_MINUTES = {"10 分钟": "10", "1 小时": "60", "8 小时": "480", "24 小时": "1440", "72 小时": "4320"}
@@ -3639,6 +4887,12 @@ class DesktopWindow(V31Mixin):
         self._bg(self.logic.stability, lambda s, e: None if e else self._st_render(s))
 
     def _poll_stability(self):
+        if self._closed:
+            return
+        if not self.pages.any_visible(ui_layout.POLL_PAGES["stability"]):   # v3.2：页面不可见时不取
+            self.root.after(15000, self._poll_stability)
+            return
+
         def done(s, err):
             if err is None:
                 self._st_render(s)
@@ -3702,6 +4956,12 @@ class DesktopWindow(V31Mixin):
     def _st_chart(self, s):
         c = self.st_canvas
         c.delete("all")
+        self._st_last = s
+        pal = self._pal                         # v3.3：颜色跟随主题
+        try:
+            c.configure(bg=pal["chart_bg"])
+        except Exception:  # noqa
+            pass
         buckets = s.get("buckets") or []
         if not buckets:
             return
@@ -3709,24 +4969,24 @@ class DesktopWindow(V31Mixin):
         h, pad = 130, 34
         n = max(1, int(s["duration"] / s["bucket_sec"]) if s.get("bucket_sec") else len(buckets))
         mx = max([1] + [b.get("max") or 0 for b in buckets])
-        c.create_text(2, 8, text="%.0fms" % mx, anchor="nw", fill="#666", font=("Microsoft YaHei", 8))
-        c.create_line(pad, h, w, h, fill="#ccc")
+        c.create_text(2, 8, text="%.0fms" % mx, anchor="nw", fill=pal["chart_axis"], font=theme.font(8))
+        c.create_line(pad, h, w, h, fill=pal["chart_frame"])
         pts = []
         for b in buckets:
             x = pad + (b["i"] / n) * (w - pad - 5)
             bw = max(1.5, (w - pad - 5) / n - 1)
             if b.get("fail"):
                 bh = max(3, (b["fail"] / b["n"]) * (h - 20)) if b["n"] else 3
-                c.create_rectangle(x, h - bh, x + bw, h, fill="#dc3545", outline="")
+                c.create_rectangle(x, h - bh, x + bw, h, fill=pal["danger"], outline="")
             if b.get("avg") is not None:
                 pts += [x + bw / 2, h - (b["avg"] / mx) * (h - 20)]
         if len(pts) >= 4:
-            c.create_line(*pts, fill="#1f4e79", width=2)
-        c.create_text(pad, h + 4, text="0", anchor="nw", fill="#666", font=("Microsoft YaHei", 8))
-        c.create_text(w - 70, h + 4, text=s.get("total_text", ""), anchor="nw", fill="#666",
-                      font=("Microsoft YaHei", 8))
+            c.create_line(*pts, fill=theme.series_color(self._theme_name, 0), width=2)
+        c.create_text(pad, h + 4, text="0", anchor="nw", fill=pal["chart_axis"], font=theme.font(8))
+        c.create_text(w - 70, h + 4, text=s.get("total_text", ""), anchor="nw", fill=pal["chart_axis"],
+                      font=theme.font(8))
         c.create_text(w / 2 - 130, h + 4, text=tr("蓝线 = 平均延迟，红柱 = 失败比例（每段 %s 秒）") % s.get("bucket_sec"),
-                      anchor="nw", fill="#666", font=("Microsoft YaHei", 8))
+                      anchor="nw", fill=pal["chart_axis"], font=theme.font(8))
 
     def _open_csv(self):
         path = self.logic.stab_csv_path(self._st_csv_name)
@@ -3738,13 +4998,9 @@ class DesktopWindow(V31Mixin):
             self._show(True, tr("明细 CSV 在：%s") % path)
 
     # ---- 标签页 4：系统设置 ----
-    def _build_system_tab(self, nb):
+    def _sec_source(self, inner):
+        """v3.1「系统设置」页的「数据源」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
         tk, ttk = self.tk, self.ttk
-        from tkinter import scrolledtext
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("系统设置"))
-        inner = _scrollable(tab, tk, ttk)
-
         sec = self._section(inner, tr("数据源"))
         self._field(sec, "watch_dirs", tr("监控目录（每行一个）"),
                     tr("存放 *_V3.db / *.mbd 的文件夹，必须真实存在，例如 D:\\GCP\\DataBrowser"), "text")
@@ -3752,6 +5008,9 @@ class DesktopWindow(V31Mixin):
         self._field(sec, "last_n", tr("每流路最近周期数"), "", "num")
         self._field(sec, "max_points", tr("单曲线最大发布点数"), "", "num")
 
+    def _sec_opcua(self, inner):
+        """v3.1「系统设置」页的「OPC UA 服务」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("OPC UA 服务"))
         self._field(sec, "endpoint", tr("监听地址 endpoint"), "", "str", restart=True)
         self._field(sec, "server_name", tr("服务器名称"), "", "str", restart=True)
@@ -3760,11 +5019,17 @@ class DesktopWindow(V31Mixin):
         self._field(sec, "allow_anonymous", tr("允许匿名只读连接"), "", "bool")
         self._field(sec, "allow_insecure_fallback", tr("保留不加密备用入口"), tr("仅排障用，用完请关闭"), "bool", restart=True)
 
+    def _sec_csv_remote(self, inner):
+        """v3.1「系统设置」页的「CSV 导出」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("CSV 导出"))
         self._field(sec, "remote_export", tr("允许远程调用 ExportCSV"), "", "bool")
         self._field(sec, "export_min_interval_sec", tr("远程导出最短间隔（秒）"), "", "num")
         self._field(sec, "csv_export_dir", tr("导出目录"), "", "str")
 
+    def _sec_advanced(self, inner):
+        """v3.1「系统设置」页的「高级设置」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("高级设置"))
         self._field(sec, "max_trace_points", tr("单条谱图最大采样点"), "", "num")
         self._field(sec, "max_file_mb", tr("单个 .mbd 上限（MB）"), "", "num")
@@ -3780,6 +5045,9 @@ class DesktopWindow(V31Mixin):
         self._field(sec, "web_cert_file", tr("自有证书文件（PEM）"), tr("留空 = 自动生成"), "str", restart=True)
         self._field(sec, "web_key_file", tr("自有私钥文件（PEM）"), tr("留空 = 自动生成"), "str", restart=True)
 
+    def _sec_accounts(self, inner):
+        """v3.1「系统设置」页的「登录账号」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("登录账号"))
         self.users_lb = tk.Listbox(sec, height=4, exportselection=False)
         self.users_lb.pack(fill="x", pady=4)
@@ -3795,8 +5063,11 @@ class DesktopWindow(V31Mixin):
         tk.Button(sec, text=tr("一键加固（开启加密 + 关闭匿名 + 用上面的账号）"),
                   command=self._harden).pack(anchor="w", pady=4)
 
+    def _sec_sec_report(self, inner):
+        """v3.1「系统设置」页的「安全体检」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("安全体检"))
-        self.report_text = scrolledtext.ScrolledText(sec, height=8, state="disabled", wrap="word")
+        self.report_text = self._scrolled_text(sec, height=8, state="disabled", wrap="word")
         self.report_text.pack(fill="x", pady=4)
         self.cfg_path_var = tk.StringVar(value="")
         tk.Label(sec, textvariable=self.cfg_path_var, fg="#888", anchor="w").pack(fill="x")
@@ -3861,7 +5132,6 @@ class DesktopWindow(V31Mixin):
         self.tab_channels = tab
         top = tk.Frame(tab)
         top.pack(fill="x", padx=8, pady=(8, 2))
-        self.rec_note = tk.StringVar(value=tr("正在读取……"))
         tk.Label(top, textvariable=self.rec_note, anchor="w", fg="#555").pack(side="left", fill="x", expand=True)
         tk.Button(top, text=tr("在谱图预览中查看"), command=self._chd_open).pack(side="right", padx=4)
         tk.Button(top, text=tr("立即刷新"), command=lambda: self._refresh_records(force=True)).pack(side="right", padx=4)
@@ -3876,9 +5146,9 @@ class DesktopWindow(V31Mixin):
         self.chd_tree.configure(yscrollcommand=bar.set)
         self.chd_tree.pack(side="left", fill="both", expand=True)
         bar.pack(side="right", fill="y")
-        self.chd_tree.tag_configure("alert", foreground="#cf222e")
-        self.chd_tree.tag_configure("offline", foreground="#6e7781")
-        self.chd_tree.tag_configure("muted", foreground="#9a6700")
+        # v3.3：告警 / 离线 / 屏蔽行的颜色（告警行浅红底、屏蔽行浅黄底、离线行灰字）由 theme.TREE_TAGS 按主题设置
+        for tag, kw in theme.tree_tags(self._pal).items():
+            self.chd_tree.tag_configure(tag, **kw)
         self.chd_tree.bind("<Double-1>", self._chd_open)
         self.chd_tree.bind("<Return>", self._chd_open)
         tk.Label(tab, text=tr("每 5 秒自动刷新。服务运行中显示正在发布的数据和告警；服务没运行时直接读数据目录（不发布）。"
@@ -3901,9 +5171,9 @@ class DesktopWindow(V31Mixin):
             tk.Radiobutton(top, text=tr(text), value=key, variable=self.pv_series,
                            command=lambda: self._pv_draw(force=True)).pack(side="left")
         tk.Button(top, text=tr("刷新"), command=lambda: self._refresh_records(force=True)).pack(side="right", padx=4)
-        self.pv_note = tk.StringVar(value="")
         tk.Label(tab, textvariable=self.pv_note, anchor="w", fg="#555").pack(fill="x", padx=8)
         self.pv_canvas = tk.Canvas(tab, bg="white", highlightthickness=1, highlightbackground="#d0d7de")
+        theme.set_roles(self.pv_canvas, background="chart_bg", highlightbackground="border", highlightcolor="border")
         self.pv_canvas.pack(fill="both", expand=True, padx=8, pady=4)
         self.pv_canvas.bind("<Configure>", lambda _e: self._pv_draw(force=True))
         self.pv_info = tk.StringVar(value="")
@@ -3919,7 +5189,7 @@ class DesktopWindow(V31Mixin):
         top = tk.Frame(tab)
         top.pack(fill="x", padx=8, pady=(8, 2))
         self.cl_sum = tk.StringVar(value=tr("服务未运行：没有客户端连接"))
-        tk.Label(top, textvariable=self.cl_sum, anchor="w", font=("Microsoft YaHei", 10, "bold")).pack(side="left")
+        tk.Label(top, textvariable=self.cl_sum, anchor="w", font=theme.font(10, "bold")).pack(side="left")
         tk.Button(top, text=tr("刷新"), command=self._refresh_sessions).pack(side="right", padx=4)
         cols = ("addr", "name", "user", "since", "state")
         self.cl_tree = ttk.Treeview(tab, columns=cols, show="headings", height=14)
@@ -3928,26 +5198,31 @@ class DesktopWindow(V31Mixin):
             self.cl_tree.heading(col, text=title)
             self.cl_tree.column(col, width=width, anchor="w")
         self.cl_tree.pack(fill="both", expand=True, padx=8, pady=4)
-        tk.Label(tab, text=tr("每 5 秒自动刷新。连接时间为本窗口第一次看到该连接的时刻；连接数达到上限（系统设置 → 最大连接数）"
+        tk.Label(tab, text=tr("每 5 秒自动刷新。连接时间为本窗口第一次看到该连接的时刻；连接数达到上限（系统 › 常用设置 → OPC UA 服务 → 最大连接数）"
                            "后新的客户端会被拒绝。会话信息取自 OPC UA 服务端内部，个别 asyncua 版本取不到时显示“无法获取”。"),
                  fg="#777", anchor="w", justify="left", wraplength=960).pack(fill="x", padx=8, pady=(0, 6))
 
-    def _build_quick_tab(self, nb):
+    def _sec_quick_common(self, inner):
+        """v3.1「常用设置」页的「常用配置」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
         tk, ttk = self.tk, self.ttk
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("常用设置"))
-        self.tab_quick = tab
-        inner = _scrollable(tab, tk, ttk)
         sec = self._section(inner, tr("常用配置"))
         tk.Label(sec, text=tr("最常改的几项集中在这里。保存时用与服务启动完全相同的规则校验，不合法不会写入并说明原因；"
-                           "保存后会告诉你哪些自动生效、哪些需要重启服务。其余设置在“告警与通知”“系统设置”页。"),
+                           "保存后会告诉你哪些自动生效、哪些需要重启服务。告警通知在“监控 › 告警 → 通知设置”，其余服务设置在本页的“OPC UA 服务”“高级设置”子标签。"),
                  fg="#777", anchor="w", justify="left", wraplength=860).pack(fill="x")
         for f in df.QUICK_FIELDS:
             self._qfield(sec, *f)
+
+    def _sec_quick_notify(self, inner):
+        """v3.1「常用设置」页的「告警桌面提醒」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("告警桌面提醒"))
         for f in df.DESKTOP_FIELDS[:3]:
             self._qfield(sec, *f)
         tk.Button(sec, text=tr("发送一条测试提醒"), command=self._test_notify).pack(anchor="w", pady=4)
+
+    def _sec_quick_startup(self, inner):
+        """v3.1「常用设置」页的「启动与登录」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("启动与登录"))
         self.login_var = tk.BooleanVar(value=df.login_open_enabled())
         self._row(sec, tr("登录 Windows 后自动打开窗口"),
@@ -3958,7 +5233,11 @@ class DesktopWindow(V31Mixin):
         tk.Label(sec, textvariable=self.login_path, fg="#888", anchor="w").pack(fill="x", padx=(190, 0))
         for f in df.DESKTOP_FIELDS[3:]:
             self._qfield(sec, *f)
-        self._build_lang_section(inner)        # v3.1
+
+    def _sec_quick_lang(self, inner):
+        """v3.1「常用设置」页的「界面语言」区域 + 常用设置的保存按钮。"""
+        tk = self.tk
+        self._build_lang_section(inner)
         bar = tk.Frame(inner)
         bar.pack(fill="x", padx=6, pady=8)
         tk.Button(bar, text=tr("保存"), width=10, command=self._qs_save).pack(side="left", padx=4)
@@ -4060,7 +5339,8 @@ class DesktopWindow(V31Mixin):
     def _poll_records(self):
         if self._closed:
             return
-        self._refresh_records()
+        if self.pages.any_visible(ui_layout.POLL_PAGES["records"]):   # v3.2：只在总览 / 通道 / 谱图可见时读
+            self._refresh_records()
         self.root.after(5000, self._poll_records)
 
     def _refresh_records(self, force=False):
@@ -4090,6 +5370,7 @@ class DesktopWindow(V31Mixin):
             self._render_channel_table()
             self._pv_update_options()
             self._pv_draw()
+            self._render_overview()
         self._bg(load, done)
 
     def _render_channel_table(self):
@@ -4127,8 +5408,8 @@ class DesktopWindow(V31Mixin):
         key = self._chd_keys.get(iid)
         if not key:
             return self._show(False, tr("请先在表格里选中一个通道。")) if event is None else None
+        self._show_page("preview")    # v3.2：先打开谱图预览页（懒加载），再选中通道
         self._pv_select_key(key)
-        self.nb.select(self.tab_preview)
 
     # ---- 谱图预览 ----
     def _pv_update_options(self):
@@ -4168,29 +5449,34 @@ class DesktopWindow(V31Mixin):
         self._pv_sig = sig
         lay = df.plot_layout(rec, self.pv_series.get(), w, h)
         c.delete("all")
+        pal = self._pal                         # v3.3：网格线浅色、曲线用主题曲线色，深浅色都清楚
+        try:
+            c.configure(bg=pal["chart_bg"])
+        except Exception:  # noqa
+            pass
         x0, y0, x1, y1 = lay["box"]
-        font = ("Microsoft YaHei", 9)
+        font = theme.font(9)
         if lay["title"]:
-            c.create_text(x0, 4, text=lay["title"], anchor="nw", font=("Microsoft YaHei", 10, "bold"), fill="#1f4e79")
+            c.create_text(x0, 4, text=lay["title"], anchor="nw", font=theme.font(10, "bold"), fill=pal["accent"])
         if lay["empty"]:
-            c.create_text(w / 2, h / 2, text=lay["message"], fill="#777", font=("Microsoft YaHei", 11))
+            c.create_text(w / 2, h / 2, text=lay["message"], fill=pal["text_muted"], font=theme.font(11))
             self.pv_info.set(lay["info"])
             self._pv_draw_peaks(c, lay, None)
             return
         for px_, label in lay["xticks"]:
-            c.create_line(px_, y0, px_, y1, fill="#eef1f4")
-            c.create_line(px_, y1, px_, y1 + 4, fill="#57606a")
-            c.create_text(px_, y1 + 6, text=label, anchor="n", font=font, fill="#57606a")
+            c.create_line(px_, y0, px_, y1, fill=pal["chart_grid"])
+            c.create_line(px_, y1, px_, y1 + 4, fill=pal["chart_axis"])
+            c.create_text(px_, y1 + 6, text=label, anchor="n", font=font, fill=pal["chart_axis"])
         for py_, label in lay["yticks"]:
-            c.create_line(x0, py_, x1, py_, fill="#eef1f4")
-            c.create_line(x0 - 4, py_, x0, py_, fill="#57606a")
-            c.create_text(x0 - 6, py_, text=label, anchor="e", font=font, fill="#57606a")
-        c.create_rectangle(x0, y0, x1, y1, outline="#8c959f")
+            c.create_line(x0, py_, x1, py_, fill=pal["chart_grid"])
+            c.create_line(x0 - 4, py_, x0, py_, fill=pal["chart_axis"])
+            c.create_text(x0 - 6, py_, text=label, anchor="e", font=font, fill=pal["chart_axis"])
+        c.create_rectangle(x0, y0, x1, y1, outline=pal["chart_frame"])
         if len(lay["line"]) >= 4:
-            c.create_line(*lay["line"], fill="#0969da", width=1)
+            c.create_line(*lay["line"], fill=theme.series_color(self._theme_name, 0), width=1)
         self._pv_draw_peaks(c, lay, rec)       # v3.1 标峰 + 峰表
-        c.create_text((x0 + x1) / 2, h - 4, text=lay["x_title"], anchor="s", font=font, fill="#333")
-        c.create_text(x0, y0 - 3, text=lay["y_title"], anchor="sw", font=font, fill="#333")
+        c.create_text((x0 + x1) / 2, h - 4, text=lay["x_title"], anchor="s", font=font, fill=pal["chart_text"])
+        c.create_text(x0, y0 - 3, text=lay["y_title"], anchor="sw", font=font, fill=pal["chart_text"])
         self.pv_info.set(tr("%s · 绘制 %d 点（按像素抽点，保留峰值）") % (lay["info"], lay["drawn"]))
 
     # ---- 客户端连接 ----
@@ -4206,6 +5492,12 @@ class DesktopWindow(V31Mixin):
             res = self.conn_tracker.apply(df.collect_sessions(df.service_app(self.sa) if up else None))
         except Exception as e:  # noqa  任何版本差异都不能让窗口崩
             res = {"ok": False, "reason": tr("无法获取（%s）") % e, "sessions": []}
+        self._sess_res = res if up else None
+        self._render_sessions(res, up)
+        self._update_statusbar()
+        self._render_overview()
+
+    def _render_sessions(self, res, up):
         self.cl_sum.set(df.sessions_summary(res) if up else tr("服务未运行：没有客户端连接（点窗口上方“启动服务”）"))
         tree = self.cl_tree
         for item in tree.get_children():
@@ -4268,7 +5560,7 @@ class DesktopWindow(V31Mixin):
         except Exception:  # noqa
             pass
         color = "#cf222e" if level == "error" else "#9a6700"
-        tk.Label(top, text=title, fg=color, font=("Microsoft YaHei", 10, "bold"), anchor="w",
+        tk.Label(top, text=title, fg=color, font=theme.font(10, "bold"), anchor="w",
                  wraplength=360, justify="left").pack(fill="x", padx=10, pady=(8, 2))
         tk.Label(top, text=text, anchor="w", justify="left", wraplength=360).pack(fill="both", expand=True, padx=10)
         bar = tk.Frame(top)
@@ -4277,7 +5569,7 @@ class DesktopWindow(V31Mixin):
         def view():
             try:
                 self.root.deiconify()
-                self.nb.select(0)
+                self._show_page("alarms")
             except Exception:  # noqa
                 pass
             close()
@@ -4287,8 +5579,9 @@ class DesktopWindow(V31Mixin):
                 top.destroy()
             except Exception:  # noqa
                 pass
-        tk.Button(bar, text=tr("查看告警"), command=view).pack(side="right", padx=4)
+        tk.Button(bar, text=tr("查看告警"), command=view, style=theme.STYLE["primary"]).pack(side="right", padx=4)
         tk.Button(bar, text=tr("关闭"), command=close).pack(side="right", padx=4)
+        self._theme_paint(top, "bg")            # v3.3：提醒框也按当前主题着色
         top.after(15000, close)
         self._popups.append(top)
         return True
@@ -4303,19 +5596,18 @@ class DesktopWindow(V31Mixin):
     # v3.0：通讯诊断（IP 扫描 / 端口扫描 / 串口扫描与诊断）。逻辑在 commscan.py，这里只画界面。
     # 所有扫描在工作线程里跑，有进度条和停止按钮；串口操作与设备检测共用 nettest 的串口锁。
     # =====================================================================
-    def _build_comm_tab(self, nb):
-        tk, ttk = self.tk, self.ttk
-        tab = tk.Frame(nb)
-        nb.add(tab, text=tr("通讯诊断"))
-        self.tab_comm = tab
+    def _comm_intro(self, inner):
+        """通讯诊断页顶部：扫描状态初始化 + 只读探测提示（v3.1「通讯诊断」页开头）。"""
+        tk = self.tk
         self._cs_stops, self._cs_running, self._cs_results = {}, {}, {}
         self.cs_prog, self.cs_status = {}, {}
-        inner = _scrollable(tab, tk, ttk)
         tk.Label(inner, text=tr("只读探测：Ping、TCP 连接后立即断开、Modbus 读功能码 01～04，不会写任何寄存器。"
                              "扫描别人的网段前请先征得网络管理员同意（部分工控防火墙会把扫描当成攻击告警）。"),
                  fg="#9a6700", anchor="w", justify="left", wraplength=880).pack(fill="x", padx=8, pady=(6, 0))
 
-        # ---- IP 扫描 ----
+    def _sec_ip_scan(self, inner):
+        """v3.1「通讯诊断」页的「IP 扫描（在线主机）」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("IP 扫描（在线主机）"))
         row = tk.Frame(sec)
         row.pack(fill="x", pady=2)
@@ -4356,7 +5648,9 @@ class DesktopWindow(V31Mixin):
             self.ip_tree.column(col, width=width, anchor="w")
         self.ip_tree.pack(fill="x", pady=4)
 
-        # ---- 端口扫描 ----
+    def _sec_port_scan(self, inner):
+        """v3.1「通讯诊断」页的「端口扫描（单个主机）」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("端口扫描（单个主机）"))
         row = tk.Frame(sec)
         row.pack(fill="x", pady=2)
@@ -4383,7 +5677,9 @@ class DesktopWindow(V31Mixin):
             self.ps_tree.column(col, width=width, anchor="w")
         self.ps_tree.pack(fill="x", pady=4)
 
-        # ---- 串口 ----
+    def _sec_serial(self, inner):
+        """v3.1「通讯诊断」页的「串口扫描与诊断（RS-232 / RS-485 / RS-422）」区域（v3.2 拆成单独方法，由 ui_layout 组合到新页面）。"""
+        tk, ttk = self.tk, self.ttk
         sec = self._section(inner, tr("串口扫描与诊断（RS-232 / RS-485 / RS-422）"))
         tk.Button(sec, text=tr("刷新串口列表"), command=self._sp_list).pack(anchor="w")
         cols = ("device", "desc", "chip", "vidpid", "maker")
@@ -4456,7 +5752,8 @@ class DesktopWindow(V31Mixin):
         row.pack(fill="x", pady=3)
         for text, cmd in buttons:
             tk.Button(row, text=text, command=cmd).pack(side="left", padx=3)
-        self.cs_prog[key] = ttk.Progressbar(row, mode="determinate", maximum=100, length=220)
+        self.cs_prog[key] = ttk.Progressbar(row, mode="determinate", maximum=100, length=220,
+                                            style=theme.STYLE["progress"])
         self.cs_prog[key].pack(side="left", padx=8)
         self.cs_status[key] = tk.StringVar(value="")
         tk.Label(row, textvariable=self.cs_status[key], fg="#555", anchor="w").pack(side="left", fill="x", expand=True)
@@ -4641,6 +5938,8 @@ class DesktopWindow(V31Mixin):
                 self._render_alerts(a)
                 self._last_alerts = a or {}
                 self._notify_alerts(a)
+                self._update_statusbar()
+                self._render_overview()
             if not self._closed:
                 self.root.after(15000, self._poll_alerts)
         self._bg(self.logic.alerts, done)

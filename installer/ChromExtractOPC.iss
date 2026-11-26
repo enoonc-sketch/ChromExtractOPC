@@ -1,5 +1,5 @@
 ﻿; ChromExtractOPC 安装程序（Inno Setup 6.3+）
-; 编译：iscc /DMyAppVersion=3.1 installer\ChromExtractOPC.iss
+; 编译：iscc /DMyAppVersion=3.3 installer\ChromExtractOPC.iss
 ; 需要先运行 build_exe.bat 生成 dist\ChromExtractOPC.exe 和 dist\ChromExtractOPC-cli.exe
 ; v2.9 起为桌面软件：不再注册 Windows 服务或开机自启计划任务；安装/卸载时会清理旧版本留下的这两项。
 ; v3.0：可选任务“登录后自动打开窗口”= 在当前用户的启动文件夹 {userstartup} 放一个指向窗口版的快捷方式
@@ -7,7 +7,7 @@
 ; 本文件必须保存为 UTF-8 带 BOM，否则中文会乱码。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "3.1"
+  #define MyAppVersion "3.3"
 #endif
 #define MyAppName "色谱提取 OPC UA 服务"
 #define MyAppExe "ChromExtractOPC.exe"

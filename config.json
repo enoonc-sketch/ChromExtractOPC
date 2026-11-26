@@ -88,5 +88,8 @@
   "desktop_report_dir": "运行报表",
   "desktop_auth": true,
   "desktop_idle_lock_minutes": 15,
-  "user_roles": {}
+  "user_roles": {},
+  "desktop_last_page": "overview",
+  "desktop_geometry": "",
+  "desktop_theme": "auto"
 }
