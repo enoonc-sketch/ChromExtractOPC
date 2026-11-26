@@ -10,32 +10,87 @@
 
 完整使用说明见 [使用说明_OPCUA.md](使用说明_OPCUA.md)。
 
+## 运行方式（v2.9 起：桌面软件）
+
+**双击 `ChromExtractOPC.exe` 就打开主窗口，OPC UA 服务随窗口自动启动；关闭窗口即停止服务。**
+不再有后台静默运行、Windows 服务、开机自启计划任务（`--background`、`--status`、`--stop`、
+`--install-service` 等参数已删除，带这些参数启动会提示并退出）。DCS/SCADA 需要数据期间请保持窗口打开（可最小化）。
+
+主窗口里可以完成全部日常操作：
+
+| 位置 | 功能 |
+|---|---|
+| 顶部按钮栏 | **启动服务 / 停止服务 / 重启服务**（状态栏显示运行中、启动中、已停止或启动失败原因）、**自检**、**打开网页设置页**、**打开日志文件夹** |
+| 顶部第二行 | 安全体检摘要、**安全设置…**、485配型诊断、发送测试数据、数据传输检测、智能诊断 |
+| 运行状态 | 运行告警与静默状态、设备检测、通道告警设置 |
+| **通道数据（v3.0）** | 每个通道（站点 / 应用 / 流路 / 检测器）的最新周期时间、周期号、点数、采样间隔、时长、状态 / 告警、最后更新，**每 5 秒自动刷新**；**双击一行跳到谱图预览** |
+| **谱图预览（v3.0）** | 用窗口自带的画布画最新周期谱图曲线（不需要 matplotlib），下拉框切换通道，可选 **原始值 / 微伏 / 值**，随窗口缩放，显示坐标轴、周期时间、点数；服务运行中显示正在发布的快照，服务没运行时直接读数据目录。**v3.1：峰识别与峰表**（基线 + 平滑 + 导数 / 阈值找峰，参数可调：最小峰高、最小半峰宽、噪声倍数、平滑点数、积分起止），曲线上标注峰号和基线，峰表列出保留时间、峰高、峰面积、面积%、半峰宽，可导出 CSV |
+| **历史对比（v3.1）** | 服务运行期间每个新周期都存进 `history\history.db`（曲线 zlib 压缩）；按日期范围、通道查询周期列表，**多选后叠加对比**（不同颜色 + 图例，原始值 / 微伏 / 值），导出所选周期 CSV；保留天数 / 容量上限自动清理 |
+| **客户端连接（v3.0）** | 当前 OPC UA 会话：客户端地址、会话名、用户、连接时间，连接数 / 上限，每 5 秒刷新 |
+| **运行报表（v3.1）** | 按日 / 按班（班次时间可配置）统计通道状态、周期数、告警次数与持续时长、服务在线时长与在线率、客户端连接数峰值；导出 **.xlsx**（标准库生成，不加依赖）+ **.html**（浏览器打印成 PDF）；可勾选“窗口运行期间每天 / 每班自动生成”（窗口内定时器，不建计划任务） |
+| 数据与导出 | **选择 / 添加数据目录**（立即保存，服务运行中下一轮扫描生效）、**查看数据源**（同 `--list`）、**导出 CSV**（同 `--extract`，可限定每流路最近 N 个周期，每次导出到带时间的子文件夹） |
+| 告警与通知 | 告警阈值、群机器人、静默时段、邮件通知、各渠道级别 |
+| 诊断工具 | 驱动与软件环境检测、连接测试、Modbus Poll / Slave、稳定性测试、多目标对比 |
+| **通讯诊断（v3.0）** | **IP 扫描**（网段 / 起止 IP 并发 Ping：延迟、主机名、MAC，可同时扫 502/4840/102/44818/20000/80/443 和自定义端口，最多 1024 个地址，可停止，导出 CSV）；**端口扫描**（单个主机、端口范围 / 列表，显示开放端口和常见服务名）；**串口扫描与诊断**（串口列表含驱动芯片 VID/PID，RS232 / RS485 / RS422 接线提示，波特率自动探测，Modbus RTU 站号扫描 1～247，环回测试，原始收发 HEX/文本）。全部在工作线程运行，有进度条和停止按钮，只读探测不写寄存器 |
+| **Modbus 转发（v3.1）** | 把每个通道的周期号、点数、心跳、告警数、峰面积 / 保留时间 / 峰高等写成 **Modbus TCP 只读从站**（功能码 03/04，其它功能码返回异常码 01），默认 `127.0.0.1:502` 不对外；来源 IP 白名单、站号、float32 字节序 ABCD / CDAB / BADC / DCBA；按当前通道**自动生成映射表**或逐项添加，**导出映射表 CSV** 给 DCS 组态；随服务启停 |
+| **常用设置（v3.0）** | 在窗口里直接改 OPC UA 端口、扫描周期、最近周期数、最大点数、告警阈值、CSV 导出目录、网页端口 / 开关；**告警桌面提醒**开关；**登录后自动打开窗口 / 打开窗口后自动启动服务 / 启动时最小化**；保存时说明哪些自动生效、哪些需重启，可一键“**保存并重启服务**” |
+| 系统设置 | 数据源、OPC UA 服务、CSV 导出、高级设置、登录账号、一键加固、安全体检 |
+| **备份与审计（v3.1）** | **导出配置备份**（config.json + 账号哈希 + `certs\` 下 OPC UA / 网页证书和私钥 + 信任的客户端证书，可选日志；可用密码 AES-256-GCM 加密，未加密含私钥时明确警告）；**从备份还原**（校验 manifest / SHA-256 / 版本 / 路径穿越 / 大小上限 → 预览将覆盖的文件 → 自动备份当前配置到 `backups\` → normalize_config 校验，失败回滚 → 可“还原并重启服务”）；**账号与角色**；**操作审计日志**查询、防篡改校验、导出 CSV |
+| 底部 | 保存设置 / 放弃修改；运行日志实时显示（清空显示、打开日志文件） |
+
+- **登录与权限（v3.1）**：窗口顶部有登录栏。没登录 = **操作员（只看）**；**工程师**可改配置、启停服务、诊断、导出、编辑 Modbus 映射、生成报表；**管理员**另可管理账号与角色、安全设置、备份与还原、导出审计日志。账号就是 `config.json` 的 `users`（PBKDF2 哈希，和 OPC UA 登录同一套），角色在 `user_roles`；第一次使用时点“**创建管理员…**”。空闲 `desktop_idle_lock_minutes`（默认 15）分钟自动锁定回只读。服务随窗口自动启动不需要登录。
+- **操作审计（v3.1）**：窗口和网页设置页的每次修改都追加到 `logs\audit.log`（时间、用户、来源、操作、修改前 / 后，密码等敏感值打码），每行带 SHA-256 哈希链，删改任何一行都能被“校验防篡改”发现。
+- **中英文界面（v3.1）**：菜单“语言 / Language”或“常用设置 → 界面语言”切换中文 / English / 跟随系统（`desktop_language`），**即时刷新**；网页设置页右上角也能切换。日志内容和 OPC UA 节点名不翻译。
+- 关闭窗口时如果服务在运行，会先确认“关闭窗口会停止 OPC UA 服务”。
+- `ChromExtractOPC.exe --settings`（或 `打开设置页面.bat`）：打开主窗口但**不自动启动服务**，适合只改设置、做诊断；窗口里随时可点“启动服务”。
+- 单实例：同一台电脑只能打开一个主窗口（避免两个服务抢 4840 端口），再次双击会提示“程序已在运行”。
+- 改了标有“需重启”的设置（端口、加密方式等），保存后点“重启服务”即可生效，不用关窗口。
+- **新告警桌面提醒（v3.0）**：新告警出现时任务栏按钮闪烁，并弹出 Windows 通知气泡（托盘图标只在窗口打开期间存在）；
+  气泡不可用时改用 PowerShell 系统通知，再不行就在窗口里弹一个置顶小提示框。可在“常用设置”里关闭、只提醒严重告警，
+  默认遵守“告警与通知”页的静默时段。同一条告警只提醒一次，恢复后再出现会再提醒。
+- **登录后自动打开窗口（v3.0）**：“常用设置”里勾选后，在当前用户的“启动”文件夹（`shell:startup`，即
+  `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup`）创建 `色谱提取 OPC UA 服务.lnk`，取消勾选即删除。
+  这只是**登录 Windows 后打开可见的桌面窗口**，不是后台服务，也不是计划任务；配合“启动时最小化”使用最方便。
+  安装程序也提供同名的可选任务（默认不勾选），卸载时删除。
+
+### 两个 EXE
+
+| 文件 | 用途 |
+|---|---|
+| `ChromExtractOPC.exe` | **桌面软件（窗口版）**：双击打开主窗口，没有黑色控制台窗口 |
+| `ChromExtractOPC-cli.exe` | **命令行版**：给脚本/安装程序/技术人员用（`--selftest`、`--extract`、`--list`、`--diagnose`、`--admin` 安全管理菜单等），有控制台输出和返回码；不带参数运行时同样打开主窗口 |
+
+窗口版也能带工具参数运行（例如 `ChromExtractOPC-cli.exe --selftest`），结果会在对话框里显示；需要输入密码的
+`--admin / --harden / --add-user / --hash-password` 和需要 Ctrl+C 结束的 `--modbus-slave`、连续轮询请用命令行版。
+
 ## 快速上手
 
 ### 方式一：在 GitHub 上打包（推荐，不用装 Python）
 
 1. 打开本仓库的 **Actions** 页，选择 **Build EXE**，点 **Run workflow**。
 2. 等跑完，在这次运行的页面底部下载产物 **ChromExtractOPC-Windows**，
-   里面有 `ChromExtractOPC.exe`、`config.json`、`启动服务.bat` 和使用说明。
-3. 把整个文件夹拷到现场电脑，双击 `ChromExtractOPC.exe` 即可启动。
+   里面有 `ChromExtractOPC.exe`、`ChromExtractOPC-cli.exe`、`config.json`、安装/卸载脚本和使用说明。
+3. 把整个文件夹拷到现场电脑，双击 `ChromExtractOPC.exe` 即可打开主窗口。
 
-推一个 `v*` 标签（例如 `v2.0`）也会自动触发打包。
+推一个 `v*` 标签（例如 `v3.0`）也会自动触发打包。
 
 ### 方式二：在本机打包
 
-在一台装了 Python 3.10+ 的电脑上，双击 `build_exe.bat`，产物在 `dist\` 文件夹。
+在一台装了 Python 3.10+ 的电脑上，双击 `build_exe.bat`：先跑全部测试，再打包两个 EXE，最后用命令行版做 `--selftest` 自检，产物在 `dist\` 文件夹。
 
 ## 安装程序（推荐给现场使用）
 
-1. 先运行 `build_exe.bat` 生成 `dist\ChromExtractOPC.exe`。
+1. 先运行 `build_exe.bat` 生成 `dist\ChromExtractOPC.exe` 和 `dist\ChromExtractOPC-cli.exe`。
 2. 安装 [Inno Setup 6.3+](https://jrsoftware.org/isdl.php)（或 `winget install JRSoftware.InnoSetup`），双击 `build_installer.bat`。
-3. 得到 `dist-installer\ChromExtractOPC-Setup-2.4.exe`（附 `.sha256`）。GitHub Actions 也会自动生成，产物名 **ChromExtractOPC-Setup**。
+3. 得到 `dist-installer\ChromExtractOPC-Setup-3.1.exe`（附 `.sha256`）。GitHub Actions 也会自动生成，产物名 **ChromExtractOPC-Setup**。
 
-安装向导会：选数据文件夹、设置防火墙允许的地址、可选开机自启（SYSTEM 账号）、自检、创建开始菜单/桌面快捷方式。
-- 升级：直接运行新版安装程序，会先停服务再替换，**保留 config.json、账号、证书和日志**。
-- 卸载：控制面板 → 程序，或开始菜单里的"卸载"；会删除开机自启任务和防火墙规则，并询问是否删除配置和日志（默认保留）。
-- 静默安装：`ChromExtractOPC-Setup-2.4.exe /VERYSILENT /SUPPRESSMSGBOXES /TASKS=autostart`
-- 开机自启在安装程序里固定用 SYSTEM 账号；想用指定 Windows 账号运行，安装时不勾选，之后运行 `安装开机自启.bat`。
+安装向导会：选数据文件夹、设置防火墙允许的地址、自检、创建开始菜单/桌面快捷方式，完成页可勾选“立即打开”。
+可选任务“**登录 Windows 后自动打开程序窗口**”（默认不勾选）：在安装用户的启动文件夹 `{userstartup}` 放一个快捷方式。
+**不会**注册 Windows 服务或开机自启计划任务。
+- 升级：直接运行新版安装程序，会先关闭正在运行的程序窗口再替换，**保留 config.json、账号、证书和日志**；
+  从 v2.8 及以前版本升级时，会自动删除旧版留下的开机自启计划任务 / Windows 服务（否则残留的后台实例会占用 4840 端口）。
+- 卸载：控制面板 → 程序，或开始菜单里的"卸载"；会关闭程序、删除防火墙规则和旧版残留，并询问是否删除配置和日志（默认保留）。
+- 静默安装：`ChromExtractOPC-Setup-3.1.exe /VERYSILENT /SUPPRESSMSGBOXES`（静默安装后不会自动打开窗口）。
 
 ## 代码签名（可选）
 
@@ -48,39 +103,16 @@
    - `SIGN_THUMBPRINT=证书指纹`：证书已导入 Windows 证书存储或在 USB 令牌里（EV 推荐）
    - `SIGN_PFX=证书.pfx` + `SIGN_PFX_PASSWORD=密码`
    - `SIGN_PFX_BASE64` + `SIGN_PFX_PASSWORD`：给 GitHub Actions 用，放在仓库 Settings → Secrets
-4. 会签名：`ChromExtractOPC.exe`、安装程序 `Setup.exe`、卸载程序 `unins000.exe`。全部 SHA-256 + 时间戳（证书过期后签名依然有效），签完自动校验。
+4. 会签名：`ChromExtractOPC.exe`、`ChromExtractOPC-cli.exe`、安装程序 `Setup.exe`、卸载程序 `unins000.exe`。全部 SHA-256 + 时间戳（证书过期后签名依然有效），签完自动校验。
 
 注意：`.pfx` 和密码**不要**提交到仓库（`.gitignore` 已排除 `*.pfx`）。EV 令牌一般无法用于 GitHub 托管的构建机，需在本机或自建构建机上签名。
 
 ## 部署（不用安装程序时）
 
-1. 把 `dist` 文件夹整个拷贝到现场电脑（例如 `D:\ChromExtractOPC\`）。
-2. 编辑同目录的 `config.json`，把 `watch_dirs` 改成实际的日志数据库所在目录，例如：
-   ```json
-   "watch_dirs": ["D:\\GCP\\DataBrowser"]
-   ```
-3. 双击 `ChromExtractOPC.exe` 启动。窗口显示
-   `OPC UA 服务已启动：opc.tcp://0.0.0.0:4840/ChromExtract` 即成功。
-4. Windows 防火墙首次弹窗时选择“允许访问”。
-
-## 后台静默运行
-
-服务适合在现场电脑上长期无人值守运行：
-
-| 方式 | 说明 |
-|---|---|
-| **Windows 服务（推荐）** | 安装时选"注册为 Windows 服务"，或以管理员身份运行 `安装为Windows服务.bat`。在 `services.msc` 里显示为"色谱提取 OPC UA 服务"，可启动/停止/查看状态；开机**延迟自动启动**（等网络和网络盘就绪）；LocalSystem 账号；崩溃 1 分钟后自动重启（连续崩溃 5 分钟后）；关机时正常停止 |
-| 计划任务自启 | 安装时勾选，或运行 `安装开机自启.bat`。计划任务以 `--background` 启动：开机即运行、不需要登录桌面、不弹任何窗口；运行时间不限，崩溃 1 分钟后自动重启；低优先级，不抢色谱工作站的 CPU |
-| 手动后台启动 | 双击 `后台启动.bat`，或开始菜单"后台启动服务"；窗口几秒后自动关闭，服务留在后台 |
-| 查看状态 | `ChromExtractOPC.exe --status`：是否在运行、进程号、启动时间、最近心跳、设置页面地址 |
-| 停止 | `停止后台服务.bat` 或 `ChromExtractOPC.exe --stop`：请求正常停止（断开客户端、保存状态），20 秒没停才强制结束 |
-
-- 服务相关命令（需管理员）：`--install-service` 注册并启动（已注册则更新；会删除旧的计划任务自启，避免两套自启并存）、`--uninstall-service`、`--start-service`、`--stop-service`；`--service-status` 查看。卸载服务用 `卸载Windows服务.bat`，程序和配置保留。
-- 访问网络共享上的数据目录：LocalSystem 访问不了需要账号的共享盘，可在 services.msc → 属性 → 登录 里改为有权限的域/本地账号。
-- **后台模式不显示任何窗口、不往控制台输出**，所有信息写入 `logs\server.log`（自动轮转），未预期的崩溃写入 `logs\crash.log`；出错时也不会停在"按回车关闭"等人处理。
-- **单实例**：同一台电脑只运行一个服务（系统级互斥），重复启动会直接退出并记日志，不会抢端口、不会重复告警。后台服务已在运行时再打开"图形监控窗口"，会直接打开设置页面，不会另起一个服务。
-- 运行状态写在 `run\status.json`（每 15 秒心跳）；心跳超过 45 秒没更新即视为已异常退出。
-- 日常查看和修改设置用浏览器打开设置页面即可，不需要窗口程序。
+1. 把 `dist` 文件夹整个拷贝到现场电脑（例如 `D:\ChromExtractOPC\`），或右键 `安装.bat` 以管理员身份运行（自检 → 复制到 `C:\ChromExtractOPC` → 设数据目录 → 防火墙 → 快捷方式）。
+2. 双击 `ChromExtractOPC.exe` 打开主窗口，在“数据与导出”页点“选择数据目录…”，选存放 `*_V3.db` / `.mbd` 的文件夹。
+3. 窗口顶部显示 `● 服务运行中：opc.tcp://0.0.0.0:4840/ChromExtract` 即成功。
+4. Windows 防火墙首次弹窗时选择“允许访问”（或用 `设置防火墙.bat` 只放行指定地址）。
 
 ## 网页设置（推荐，不用手改 config.json）
 
@@ -98,8 +130,9 @@
 
 
 
-服务启动后会同时打开一个**设置页面**：浏览器访问 <http://127.0.0.1:8840/>
-（或双击 `打开设置页面.bat`，图形窗口里也有"打开设置页面…"按钮）。
+桌面主窗口是本机默认入口；需要用浏览器（例如远程查看）时，服务运行期间同时提供**设置网页**：
+<http://127.0.0.1:8840/>，主窗口顶部有“打开网页设置页”按钮（服务没运行时点它也会临时开启网页）。
+网页随服务停止/窗口关闭而关闭，不会在后台常驻。
 
 - 可修改：监控目录、扫描周期、endpoint、安全模式、匿名开关、远程导出、日志等；添加/删除账号、一键加固。
 - 保存前按服务启动时的同一套规则校验，不合法不会写入；写入前自动备份为 `config.json.bak`。
@@ -109,7 +142,6 @@
 - HTTPS 证书：默认自动生成设置页面专用的自签名证书 `certs\web_cert.pem`（与 OPC UA 证书分开）；
   浏览器首次会提示"不安全"，核对页面/日志里显示的 SHA-256 指纹一致后继续即可，
   或把 `web_cert.pem` 导入"受信任的根证书颁发机构"。有公司证书时填 `web_cert_file` / `web_key_file`（PEM）。
-- 服务没运行时：`ChromExtractOPC.exe --settings` 只打开设置页面。
 
 ## 设备检测（网络 / 串口设备接入告警）
 
@@ -126,14 +158,14 @@
 
 ## 驱动与软件环境检测
 
-设置页面"驱动与软件环境检测"或命令行 `ChromExtractOPC.exe --drivercheck`。只读检查，不安装、不修改：
+设置页面"驱动与软件环境检测"或命令行 `ChromExtractOPC-cli.exe --drivercheck`。只读检查，不安装、不修改：
 
 | 检查项 | 内容 |
 |---|---|
 | 串口设备与驱动 | 每个 COM 口的芯片（CH340/CH341、FTDI、CP210x、PL2303 等）、驱动厂商、版本、日期、是否签名 |
 | 有问题的设备 | 设备管理器里带黄色感叹号或未装驱动的串口设备，翻译错误代码（如 28 没装驱动、10 无法启动），按芯片给出驱动下载提示；PL2303 假芯片单独提示 |
 | 运行库 | asyncua、cryptography、pyserial 是否可用及版本 |
-| 系统 | 操作系统版本、Windows 防火墙服务、开机自启任务状态及上次运行结果、OPC UA 端口是否在监听 |
+| 系统 | 操作系统版本、Windows 防火墙服务、OPC UA 端口是否在监听；检测到旧版本留下的开机自启计划任务 / Windows 服务时提示清理（会占用端口） |
 | 数据目录 | 监控目录是否存在、可读，里面有几个数据文件；提示 SYSTEM 账号看不到映射盘符 |
 
 结果按"问题 / 注意 / 正常"排序，每项附处理办法。
@@ -196,17 +228,17 @@
 
 - **同一串口上的多个站**（同一条 485 总线）自动**按顺序轮询**：485 是半双工，不能同时通信；这些目标的串口参数必须一致。不同串口、网络目标真正并行。
 - 结束后生成对比汇总 `logs\stability\stability_multi_时间.csv`，每个目标另有明细 CSV。
-- 命令行：`ChromExtractOPC.exe --stability-multi 目标.json interval=1 minutes=60`，目标文件格式见 `tools\stability_targets_example.json`。
+- 命令行：`ChromExtractOPC-cli.exe --stability-multi 目标.json interval=1 minutes=60`，目标文件格式见 `tools\stability_targets_example.json`。
 
 命令行示例：
 ```
-ChromExtractOPC.exe --stability modbus_rtu port=COM3 baud=9600 unit=1 interval=1 minutes=60
-ChromExtractOPC.exe --stability ping 192.168.1.10 interval=1 minutes=1440
-ChromExtractOPC.exe --nettest ping 192.168.1.10
-ChromExtractOPC.exe --nettest tcp 192.168.1.10 4840
-ChromExtractOPC.exe --nettest serial_list
-ChromExtractOPC.exe --nettest modbus_rtu port=COM3 baud=9600 parity=N unit=1 addr=0 count=10
-ChromExtractOPC.exe --nettest modbus_tcp 192.168.1.20 502 unit=1 func=3 addr=0 count=10
+ChromExtractOPC-cli.exe --stability modbus_rtu port=COM3 baud=9600 unit=1 interval=1 minutes=60
+ChromExtractOPC-cli.exe --stability ping 192.168.1.10 interval=1 minutes=1440
+ChromExtractOPC-cli.exe --nettest ping 192.168.1.10
+ChromExtractOPC-cli.exe --nettest tcp 192.168.1.10 4840
+ChromExtractOPC-cli.exe --nettest serial_list
+ChromExtractOPC-cli.exe --nettest modbus_rtu port=COM3 baud=9600 parity=N unit=1 addr=0 count=10
+ChromExtractOPC-cli.exe --nettest modbus_tcp 192.168.1.20 502 unit=1 func=3 addr=0 count=10
 ```
 
 ## 异常告警
@@ -224,7 +256,7 @@ ChromExtractOPC.exe --nettest modbus_tcp 192.168.1.20 502 unit=1 func=3 addr=0 c
 告警会出现在这些地方：
 - 日志 `logs\server.log`
 - 网页设置页顶部的"运行告警"（每 15 秒刷新，有告警时浏览器标签显示 ⚠）
-- 图形窗口状态栏
+- 桌面主窗口状态栏
 - OPC UA 节点 `Chromatograph/Alarms`：`ActiveCount`、`Severity`（0 正常 / 1 警告 / 2 严重）、`Text`、`LastChange`，DCS 订阅 `Severity` 即可接入报警
 - 可选邮件通知（见下）
 - 可选推送 `alert_webhook`：企业微信 / 钉钉 / 飞书群机器人或任意 https 地址（只允许 https），网页上可"发送测试消息"
@@ -261,7 +293,7 @@ ChromExtractOPC.exe --nettest modbus_tcp 192.168.1.20 502 unit=1 func=3 addr=0 c
 - **每天重复**：如每周一至周五 `22:00 ～ 06:00`，结束早于开始表示跨午夜；可只选部分星期。
 
 规则：
-- 静默只停**推送**（群机器人和邮件）；日志、网页、图形窗口、OPC UA `Alarms` 节点照常显示全部告警。
+- 静默只停**推送**（群机器人和邮件）；日志、网页、桌面主窗口、OPC UA `Alarms` 节点照常显示全部告警。
   OPC UA 新增 `Alarms.NotifySilenced`，DCS 可据此显示"推送已静默"。
 - 静默结束时：仍未恢复的告警补发一次"出现"；静默前已通知、静默中已恢复的补发"恢复"；
   静默中出现又恢复的不再打扰。
@@ -317,6 +349,27 @@ ChromExtractOPC.exe --nettest modbus_tcp 192.168.1.20 502 unit=1 func=3 addr=0 c
 | `allow_test_send` | `true` | 是否允许远程调用 `SendTestData` 发送测试数据（仅写 `Station_TEST` 测试通道） |
 | `test_send_min_interval_sec` | `5` | 发送测试数据的最短间隔（秒），防反复调用 |
 | `transmission_stale_sec` | `7200` | 数据超过多少秒没更新视为"数据较旧"（`Diagnostics.TransmissionStatus`） |
+| `desktop_notify` | `true` | （v3.0）新告警出现时桌面提醒：任务栏闪烁 + Windows 通知气泡 |
+| `desktop_notify_level` | `all` | （v3.0）提醒级别：`all` 严重和警告 / `critical` 只提醒严重 |
+| `desktop_notify_quiet` | `true` | （v3.0）静默时段（`alert_quiet`）内不弹桌面提醒 |
+| `desktop_auto_start_service` | `true` | （v3.0）打开窗口后自动启动服务；`--settings` 打开时一律不自动启动 |
+| `desktop_start_minimized` | `false` | （v3.0）打开窗口时最小化到任务栏 |
+
+| `desktop_language` | `auto` | （v3.1）界面语言：`auto`（按 Windows 系统界面语言）/ `zh` / `en` |
+| `backup_keep` | `10` | （v3.1）还原前自动备份 `backups\自动备份_*.zip` 保留个数 |
+| `history_enabled` / `history_file` | `true` / `history/history.db` | （v3.1）历史数据库（周期曲线 + 运行事件），需重启 |
+| `history_retention_days` / `history_max_mb` | `90` / `1024` | （v3.1）保留天数 / 曲线容量上限（MB），超出从最旧的删起，需重启 |
+| `peak_min_height` / `peak_min_width` / `peak_noise_factor` / `peak_smooth` | `0` / `0` / `5` / `5` | （v3.1）峰识别：最小峰高（0 = 只按噪声阈值）、最小半峰宽（秒）、阈值 = 噪声 × 倍数、平滑点数 |
+| `peak_start` / `peak_end` / `peak_series` | `0` / `0` / `value` | （v3.1）积分起止（秒，终点 0 = 到最后）、用哪列找峰（`value` / `uv` / `raw`） |
+| `peaks_publish` / `peaks_publish_max` | `false` / `50` | （v3.1）在每个通道下发布 `Peaks` 节点、最多几个峰（发布开关需重启） |
+| `modbus_server_enabled` / `modbus_server_host` / `modbus_server_port` | `false` / `127.0.0.1` / `502` | （v3.1）Modbus TCP 只读转发，需重启；改成对外地址时窗口会安全提示 |
+| `modbus_server_allow` / `modbus_server_unit` / `modbus_server_order` | `[]` / `0` / `ABCD` | （v3.1）来源白名单（IP / CIDR）、站号（0 = 任意）、32 位字节序 |
+| `modbus_server_map` | `[]` | （v3.1）寄存器映射表，在窗口“Modbus 转发”页编辑（保存后下一轮扫描生效） |
+| `desktop_report_auto` / `desktop_report_shifts` / `desktop_report_dir` | `off` / 白班 08:00、夜班 20:00 / `运行报表` | （v3.1）报表自动生成 `off` / `daily` / `shift`、班次、输出目录 |
+| `desktop_auth` / `desktop_idle_lock_minutes` | `true` / `15` | （v3.1）桌面窗口需要登录、空闲自动锁定分钟数（0 = 不锁定） |
+| `user_roles` | `{}` | （v3.1）`{"用户名": "operator/engineer/admin"}`，在“备份与审计 → 账号与角色”里设置 |
+
+`desktop_*` 只影响本机桌面窗口，保存后窗口立即使用，与服务的热加载 / 重启无关；只能写 `true` / `false`（级别只能 `all` / `critical`），写错时启动会提示哪一项不对。
 
 ## OPC UA 地址空间
 
@@ -342,22 +395,29 @@ Chromatograph
    └─ App<应用号>_Stream<流路号>_Det<检测器号>
       ├─ LatestCycle             周期元数据（时间、编号、点数、采样间隔等）
       ├─ Trace                   时间 / 原始计数 / 微伏 / 显示值 四条数组
-      └─ Status                  Revision（每次刷新 +1）、LastUpdate、Good
+      ├─ Status                  Revision（每次刷新 +1）、LastUpdate、Good
+      └─ Peaks（v3.1，peaks_publish=true 时）  Count、RetentionTimes、Heights、Areas、AreaPercents、Widths（Double 数组）
 ```
 
 接入建议：订阅 `LatestCycle.CycleTime`（或 `Status.Revision`）判断新周期，
 新周期到来时批量读取 `Trace.ValueArray`（时间对应用 `Trace.TimeArray`）。
 
-## 命令行模式（原有 CSV 提取功能完整保留）
+## 命令行工具（原有 CSV 提取功能完整保留，窗口“数据与导出”页也能做）
 
 ```
-ChromExtractOPC.exe --extract 数据文件夹 -o 输出文件夹 --last 20
-ChromExtractOPC.exe --list 数据文件夹          :: 查看里面有什么
-ChromExtractOPC.exe --gui                      :: 打开图形监控窗口
-ChromExtractOPC.exe --check-transmission       :: 数据传输检测（连接/读/订阅/Echo 逐步验证）
-ChromExtractOPC.exe --check-transmission --send-test-data   :: 检测时顺带发送测试数据
-ChromExtractOPC.exe --diagnose                 :: 智能诊断（五层证据 + 处理清单，异常返回非 0）
+ChromExtractOPC-cli.exe --extract 数据文件夹 -o 输出文件夹 --last 20
+ChromExtractOPC-cli.exe --list 数据文件夹          :: 查看里面有什么
+ChromExtractOPC-cli.exe --selftest                 :: 自检（临时目录起真实服务并读取，不影响现有配置）
+ChromExtractOPC-cli.exe --check-transmission       :: 数据传输检测（连接/读/订阅/Echo 逐步验证，需窗口里服务在运行）
+ChromExtractOPC-cli.exe --check-transmission --send-test-data   :: 检测时顺带发送测试数据
+ChromExtractOPC-cli.exe --diagnose                 :: 智能诊断（五层证据 + 处理清单，异常返回非 0）
+ChromExtractOPC.exe                                :: 打开桌面主窗口（服务随窗口启动）
+ChromExtractOPC.exe --settings                     :: 打开主窗口但不自动启动服务
+ChromExtractOPC-cli.exe --backup D:\备份\cfg.zip --encrypt     :: （v3.1）导出配置备份（--encrypt 提示输入密码；--with-logs 含日志）
+ChromExtractOPC-cli.exe --restore D:\备份\cfg.zip              :: （v3.1）校验并预览后还原（--yes 不再询问）
 ```
+
+- 备份 / 还原的密码也可以用环境变量 `CHROMEXTRACT_BACKUP_PASSWORD` 传入（脚本用）。`--restore` 需要在命令行版里运行；还原后请在窗口里点“重启服务”。
 
 - **数据传输检测**证明数据真的在传（不止端口通）：建会话、读版本、订阅
   `Diagnostics/TestSignal`+`Heartbeat`、读真实曲线并核对点数、`EchoTest` 往返；
@@ -376,11 +436,25 @@ ChromExtractOPC.exe --diagnose                 :: 智能诊断（五层证据 + 
 
 | 文件 | 作用 |
 |---|---|
-| `server_app.py` | 主程序：OPC UA 服务 + 数据监控 + CSV 导出 + GUI 监控窗口 |
+| `server_app.py` | 主程序：OPC UA 服务 + 数据监控 + CSV 导出 + 命令行工具 + 程序入口 |
+| `desktop_ui.py` | 桌面主窗口（tkinter）：服务启停、数据目录/导出、通道数据、谱图预览、客户端连接、常用设置、状态告警、诊断、设置 |
+| `commscan.py` | （v3.0）通讯诊断：IP 范围 / 端口扫描、ARP 与反向解析、串口列表、波特率探测、Modbus RTU 站号扫描（基于 nettest，可注入假实现测试） |
+| `desktop_features.py` | （v3.0）桌面新功能的逻辑层，不依赖 tkinter：谱图坐标/抽点、快照来源、通道表、常用配置校验与保存、会话列表、告警提醒判定与 Windows 通知、登录后自动打开窗口的快捷方式 |
+| `i18n.py` | （v3.1）中英文界面：翻译字典（以中文原文为键，缺失回退中文）、`tr()` / `tr_msg()`、跟随系统语言、窗口即时切换用的文字替换 |
+| `backup_tools.py` | （v3.1）配置备份与还原：manifest + SHA-256、PBKDF2 + AES-256-GCM 加密、路径穿越 / 大小防护、预览、自动备份、校验失败回滚、跨机清空 DPAPI 密码 |
+| `history.py` | （v3.1）历史数据与运行事件（SQLite）：周期曲线压缩存储、清理、查询、叠加对比坐标、CSV 导出 |
+| `peaks.py` | （v3.1）峰识别（纯 Python）：基线、平滑、噪声估计、找峰、积分、半峰宽、峰表 CSV、OPC UA 数组 |
+| `modbus_server.py` | （v3.1）Modbus TCP 只读从站：帧解析、寄存器映射与编码、白名单、映射表 CSV |
+| `reports.py` | （v3.1）运行报表：日 / 班统计、标准库生成 .xlsx、.html、.csv、自动生成判定 |
+| `audit.py` | （v3.1）角色权限、登录会话与空闲锁定、带哈希链的审计日志 |
+| `instance_lock.py` | 单实例（同一台电脑只开一个主窗口） |
 | `chrom_core.py` | 谱图解析核心库（BinTrc 解码、数据库/mbd 读取、CSV 输出） |
 | `config.json` | 配置文件（端口、监控目录、扫描周期、安全模式等） |
 | `build_exe.bat` | 一键打包为 EXE（在有 Python 的电脑上运行一次即可） |
-| `启动服务.bat` | 启动服务（优先用打包好的 EXE，其次用 Python 源码运行） |
+| `启动图形界面.bat` | 打开桌面主窗口（优先用打包好的 EXE，其次用 pythonw 运行源码，不弹黑窗口） |
+| `打开设置页面.bat` | 打开主窗口但不自动启动服务 |
+| `安装.bat` / `卸载.bat` | 不用安装程序时的一键安装 / 卸载（含旧版后台残留清理） |
+| `tests\server_runner.py` | 仅供自动测试：无界面启动一个服务子进程，不打包、不发布 |
 | `requirements.txt` | 依赖清单 |
 | `tools\make_demo_db.py` | 生成演示数据库，用于验收测试 |
 | `tools\opcua_test_client.py` | OPC UA 验收测试客户端 |
@@ -402,11 +476,51 @@ ChromExtractOPC.exe --diagnose                 :: 智能诊断（五层证据 + 
 | 客户端连不上 | 检查防火墙是否放行 4840；`netstat -ano \| findstr 4840` 确认在监听 |
 | 端口被占用 | 改 `config.json` 的 `endpoint` 端口（如 4841），客户端同步修改 |
 | 看不到数据 | 确认 `watch_dirs` 路径正确且包含 `*_V3.db` 或 `*.mbd`；查看 `logs\server.log` |
-| 改了 config 不生效 | 重启程序（配置只在启动时读取） |
+| 改了 config 不生效 | 能热加载的项下一轮扫描生效；标“需重启”的项在主窗口点“重启服务” |
+| 窗口里服务启动失败、提示端口被占用 | 多半是旧版本（v2.8 及以前）的后台服务/计划任务还在运行：右键 `卸载.bat` 以管理员身份运行清理，或在“诊断工具 → 驱动与软件环境检测”里查看“旧版后台运行残留” |
+| 关掉窗口后 DCS 读不到数据 | 正常：v2.9 起服务随窗口运行，关闭窗口即停止。需要持续提供数据时保持窗口打开（可最小化）；可在“常用设置”勾选“登录后自动打开窗口”+“启动时最小化” |
+| 没有看到告警通知气泡 | 检查 Windows“设置 → 系统 → 通知”是否允许通知、是否开着“专注助手 / 勿扰”；“常用设置 → 发送一条测试提醒”可测试；任务栏闪烁和窗口内提示框不受通知设置影响 |
+| 通讯诊断 IP 扫描找不到某台设备 | 对方可能禁 ping：勾选它会开放的端口（如 502）一起扫；MAC 只能取到与本机同一网段的设备（跨路由器的显示空） |
+| 波特率探测 / 站号扫描提示“正被其它测试使用” | 该串口正被设备检测或稳定性测试占用，先在“运行状态 → 设备检测”停用对应检测项，或等它结束 |
+| “客户端连接”页显示“无法获取” | asyncua 版本差异导致取不到内部会话信息，不影响服务本身；可用 `netstat -ano \| findstr 4840` 查看连接 |
+| 谱图预览没有曲线 | 服务没运行且没设置数据目录，或数据目录里没有谱图；先在“数据与导出”页选择数据目录或启动服务 |
+| 窗口里按钮点了提示“需要工程师 / 管理员权限” | v3.1 起窗口默认需要登录：点顶部“登录”；还没有管理员时点“创建管理员…”。忘记管理员密码：用命令行版 `--add-user 用户名` 重设密码（需能改 config.json 的人） |
+| 还原备份提示“密码错误，或备份包已被改动” | 输入导出时设置的备份密码；若确认密码正确，说明备份文件损坏或被改过，换一个备份 |
+| 还原后邮件发不出去 | 备份来自另一台电脑时 SMTP 密码（Windows DPAPI 本机加密）无法解密，还原时已清空，在“告警与通知”里重新填写 |
+| Modbus 转发启动失败 | 502 端口被别的程序占用（例如 Modbus Slave 模拟器或其它网关软件），看运行日志；可改端口 |
+| 历史对比提示“还没有历史数据” | 服务运行并扫描到新周期后才开始记录（`history_enabled=true`） |
+| 英文界面里个别诊断细节仍是中文 | 正常：只翻译界面文字；后台返回的个别错误详情、日志内容和 OPC UA 节点名保持不变 |
 | 加密模式客户端报证书错误 | 把 `certs\server_cert.der` 导入客户端受信任列表，或先用 `none` 模式排通 |
 
 ## 版本
 
+- **v3.1（备份还原、中英文界面、历史对比、峰表、Modbus 转发、运行报表、权限与审计；仍然没有任何后台运行）**：
+  - 配置备份与还原（`backup_tools.py`，窗口“备份与审计”页 + `--backup` / `--restore`）；
+  - 中英文界面（`i18n.py`），窗口即时切换，网页设置页也可切换；
+  - 历史数据（`history.py`，SQLite）与“历史对比”页；峰识别与峰表（`peaks.py`），可选发布 OPC UA `Peaks` 节点；
+  - Modbus TCP 只读转发（`modbus_server.py`，纯标准库）；运行报表（`reports.py`，标准库生成 xlsx）；
+  - 桌面登录、角色权限、空闲锁定与带哈希链的操作审计（`audit.py`），网页设置页的修改也记审计；
+  - 两个 EXE 的 hidden-import 加入 7 个新模块；没有新增第三方依赖。
+- **v3.0（桌面窗口功能增强，仍然没有任何后台运行）**：
+  - 新增“通道数据”页（每 5 秒刷新，双击跳到谱图）、“谱图预览”页（Canvas 画曲线，原始值 / 微伏 / 值，随窗口缩放）、
+    “客户端连接”页（会话地址 / 名称 / 用户 / 连接时间、连接数 / 上限）、“常用设置”页（端口、扫描周期、告警阈值、导出目录、
+    网页等；保存校验与“自动生效 / 需重启”提示、保存并重启服务）。
+  - 新告警桌面提醒：任务栏闪烁（FlashWindowEx）+ 托盘气泡（Shell_NotifyIcon）→ PowerShell 通知 → 窗口内置顶提示框，
+    可关闭、可只提醒严重、遵守静默时段。
+  - 登录后自动打开窗口（当前用户启动文件夹快捷方式，不是服务 / 计划任务）、打开窗口后自动启动服务、启动时最小化；
+    安装程序新增可选任务“登录 Windows 后自动打开程序窗口”，卸载时删除该快捷方式（`卸载.bat` 也会删除）。
+  - 新配置键 `desktop_notify` / `desktop_notify_level` / `desktop_notify_quiet` / `desktop_auto_start_service` /
+    `desktop_start_minimized`（DEFAULT_CONFIG、网页可编辑项、启动校验都已加入）。
+  - 新增“通讯诊断”页（`commscan.py`）：IP 扫描（Ping / 主机名 / MAC / 工业端口）、端口扫描、串口列表（VID/PID 芯片）、
+    RS232/485/422 接线提示、波特率自动探测、Modbus RTU 站号扫描、环回、原始收发；进度条 + 停止 + CSV 导出；与设备检测共用串口锁。
+  - 新模块 `desktop_features.py`、`commscan.py`（逻辑与 tkinter 解耦）+ `tests/test_desktop_features.py`、`tests/test_commscan.py`；
+    两个 EXE 的打包都加了 `--hidden-import desktop_features --hidden-import commscan`。
+- **v2.9（桌面软件化，取消后台运行）**：
+  - 默认双击即打开桌面主窗口（窗口版 EXE 无黑色控制台），服务在窗口内启动/停止/重启，关闭窗口即停止服务（先确认）；新增“数据与导出”页（选择数据目录、查看数据源、导出 CSV）、顶部“自检 / 打开网页设置页 / 打开日志文件夹”、日志窗“清空显示 / 打开日志文件”。
+  - **删除**：`--background`、`--status`、`--stop`、`--service`、`--install-service`、`--uninstall-service`、`--start-service`、`--stop-service`、`--service-status` 参数（旧参数会提示并返回 2）；`bgrun.py`、`winservice.py`、`install_autostart.ps1`、`后台启动.bat`、`停止后台服务.bat`、`安装为Windows服务.bat`、`卸载Windows服务.bat`、`安装开机自启.bat`、`启动服务.bat`；安装程序里的“开机自动在后台运行 / 注册 Windows 服务 / 计划任务”选项；`tests/test_background.py`、`tests/test_winservice.py`。
+  - 单实例改由 `instance_lock.py` 提供；驱动检测的“开机自启任务”改为“旧版后台运行残留”提示；安装程序和 `安装.bat`/`卸载.bat` 会清理旧版的计划任务和 Windows 服务（只删除，不创建）。
+  - 打包改为两个 EXE：`ChromExtractOPC.exe`（`--windowed`）+ `ChromExtractOPC-cli.exe`（`--console`，自检/脚本用）；CI 静默安装测试改为验证“没有任何计划任务、服务和常驻进程”。
+  - 新增 `tests/test_desktop_app.py`（服务控制器启停/重启/端口占用、数据目录与导出、单实例、旧参数拒绝、残留检测）；`test_security` / `test_transmission` 改用 `tests/server_runner.py` 启动服务子进程。
 - v2.0：OPC UA 服务版（监控 + 发布 + 远程导出 + GUI 监控窗口）。
 - v2.0.1（修复）：
   - 修复 `security` 设为 `sign` / `sign_encrypt` 时服务启动即崩溃的问题（安全策略名称错误、证书/私钥未 await 加载）。
@@ -445,8 +559,8 @@ ChromExtractOPC.exe --diagnose                 :: 智能诊断（五层证据 + 
   - 新增连接测试（`nettest.py`）：Ping、TCP 端口、DNS、本机网卡、OPC UA、Modbus TCP；串口列表、RS-232/485 收发、回环自检、Modbus RTU；网页和命令行 `--nettest` 均可使用。新增依赖 pyserial；长时间稳定性测试（`stability.py`）：成功率/丢包率、延迟百分位、抖动、最长连续失败、错误分布与排查建议、趋势图和 CSV 明细，网页和命令行 `--stability`；多目标并行测试（最多 16 个，同一 485 总线自动轮询，失败时间关联分析判断公共故障还是单台故障，对比汇总 CSV，`--stability-multi`）。
   - 新增设备检测（`probes.py`）：定时检测 Ping / 端口 / OPC UA / Modbus / 串口设备，连续失败达到次数走告警，自动恢复，可用率统计；串口全局互斥锁。
   - 新增驱动与软件环境检测（`drivercheck.py`、`--drivercheck`）：串口驱动和芯片识别、异常设备与错误代码、运行库、防火墙、自启任务、端口、数据目录；服务启动时自动检测并定期复查（`envwatch.py`），问题项接入告警。
-  - 后台静默运行（`bgrun.py`）：`--background` 无窗口运行、日志只写文件；单实例互斥；`--status` / `--stop` 正常停止；开机自启任务改为后台模式、低优先级；新增 `后台启动.bat`、`停止后台服务.bat`。
-  - 注册为真正的 Windows 服务（`winservice.py`，纯 ctypes，无新依赖）：services.msc 可启停、延迟自动启动、崩溃自动重启、关机时正常停止；安装程序和 `安装.bat` 可选服务或计划任务；CI 增加服务注册、启停、卸载测试。
+  - （v2.9 已移除）后台静默运行（`bgrun.py`）：`--background` 无窗口运行、日志只写文件；单实例互斥；`--status` / `--stop` 正常停止；开机自启任务改为后台模式、低优先级；新增 `后台启动.bat`、`停止后台服务.bat`。
+  - （v2.9 已移除）注册为真正的 Windows 服务（`winservice.py`，纯 ctypes，无新依赖）：services.msc 可启停、延迟自动启动、崩溃自动重启、关机时正常停止；安装程序和 `安装.bat` 可选服务或计划任务；CI 增加服务注册、启停、卸载测试。
   - 打包：本地 `build_exe.bat` 和 GitHub Actions 都会先跑测试再打包，打包后自检（OPC UA + HTTPS 设置页面），生成 `ChromExtractOPC.exe.sha256` 校验文件。
 - v2.5（在 v2.4 网页版基础上合并数据传输检测与发送 + 智能诊断）：
   - 新增只读 `Diagnostics` 诊断节点（测试信号/计数、通道计数、数据年龄、传输状态、运行时长、诊断摘要），每轮扫描更新；无新谱图时订阅 `TestSignal` 也能证明传输活着。

@@ -146,6 +146,10 @@ def remove_user(path, name):
                               "请先添加别的账号，或先允许匿名访问（allow_anonymous=true）。")
     del users[name]
     data["users"] = users
+    roles = data.get("user_roles")
+    if isinstance(roles, dict) and name in roles:
+        roles.pop(name, None)            # v3.1：账号删除后角色一并删除
+        data["user_roles"] = roles
     write_atomic(path, data)
 
 
@@ -215,7 +219,22 @@ EDITABLE = {
     "smtp_user": str, "smtp_from": str,
     "alert_webhook_level": str, "alert_email_level": str,
     "env_check_on_start": bool, "env_check_hours": int,
+    # v3.0 桌面窗口设置（只影响本机窗口）
+    "desktop_notify": bool, "desktop_notify_level": str, "desktop_notify_quiet": bool,
+    "desktop_auto_start_service": bool, "desktop_start_minimized": bool,
+    # v3.1
+    "desktop_language": str, "backup_keep": int,
+    "history_enabled": bool, "history_file": str, "history_retention_days": int, "history_max_mb": int,
+    "peak_min_height": float, "peak_min_width": float, "peak_noise_factor": float, "peak_smooth": int,
+    "peak_start": float, "peak_end": float, "peak_series": str, "peaks_publish": bool, "peaks_publish_max": int,
+    "modbus_server_enabled": bool, "modbus_server_host": str, "modbus_server_port": int,
+    "modbus_server_allow": list, "modbus_server_unit": int, "modbus_server_order": str,
+    "desktop_report_auto": str, "desktop_report_dir": str,
+    "desktop_auth": bool, "desktop_idle_lock_minutes": int,
 }
+
+# 结构化的配置项（列表 / 字典）：不走表单，用 set_value() 整体替换并校验
+STRUCTURED = ("modbus_server_map", "desktop_report_shifts", "user_roles")
 
 
 def _coerce(key, val):
@@ -227,9 +246,15 @@ def _coerce(key, val):
             return bool(val)
         if typ is int:
             return int(str(val).strip())
+        if typ is float:
+            v = float(str(val).strip())
+            if v != v or v in (float("inf"), float("-inf")):
+                raise ValueError(val)
+            return v
         if typ is list:
             if isinstance(val, str):
-                val = [x for x in val.replace("\r", "").split("\n")]
+                val = [x for x in val.replace("\r", "").replace(",", "\n").split("\n")] if key == "modbus_server_allow" \
+                else [x for x in val.replace("\r", "").split("\n")]
             return [str(x).strip().strip('"').strip() for x in val if str(x).strip()]
         return str(val).strip()
     except (TypeError, ValueError):
@@ -364,3 +389,25 @@ def set_probes(path, items, normalize):
     data["alert_probes"] = items
     write_atomic(path, data)
     return items
+
+
+def set_value(path, key, value, normalize=None, validate=None):
+    """整体替换一个结构化配置项（STRUCTURED）。normalize(value) 规整/校验（抛 ValueError 拒绝），
+    validate(合并后的字典) 与 update_settings 相同。返回 (修改前, 修改后)。"""
+    if key not in STRUCTURED:
+        raise ConfigToolError("这个配置项不能这样修改：%s" % key)
+    if normalize is not None:
+        try:
+            value = normalize(value)
+        except ValueError as e:
+            raise ConfigToolError(str(e))
+    data = read_raw(path)
+    before = data.get(key)
+    data[key] = value
+    if validate is not None:
+        try:
+            validate(dict(data))
+        except Exception as e:  # noqa
+            raise ConfigToolError(str(e))
+    write_atomic(path, data)
+    return before, value

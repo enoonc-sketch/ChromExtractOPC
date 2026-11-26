@@ -158,7 +158,7 @@ class EnvWatchTest(unittest.TestCase):
         self.res = [{"summary": "x", "elapsed_ms": 1, "items": [
             {"name": "设备：USB2.0-Serial", "level": "问题", "text": "没有安装驱动程序。", "fix": "CH341SER"},
             {"name": "数据目录", "level": "问题", "text": "找不到", "fix": ""},
-            {"name": "开机自启任务", "level": "注意", "text": "没有安装", "fix": ""}]}]
+            {"name": "旧版后台运行残留", "level": "注意", "text": "检测到旧版计划任务", "fix": ""}]}]
 
     def test_problem_alert_then_recover(self):
         e = envwatch.EnvWatch(self.cfg, self.mon, check=lambda c: self.res[0])

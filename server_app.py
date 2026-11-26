@@ -7,18 +7,21 @@
   1. 监控配置目录中的 DataBrowser 日志数据库（*_V3.db）和 .mbd 谱图文件；
   2. 解析最新谱图（BinTrc），通过 OPC UA Server 发布，供 DCS/SCADA/实时库订阅；
   3. 提供 OPC UA 方法 ExportCSV，可远程触发把最新数据导出为 CSV；
-  4. 命令行模式：--extract 直接导出 CSV，--list 查看数据源，--gui 打开监控窗口。
+  4. 桌面软件（v2.9）：双击即打开桌面主窗口，在窗口里启动/停止服务、选数据目录、查看数据源、
+     导出 CSV、看状态告警和日志、做安全设置与诊断；关闭窗口即停止服务。不再提供后台/服务/
+     开机自启运行方式。命令行工具（--extract / --list / --selftest 等）仍保留。
   5. 数据传输检测与发送（v2.5）：Diagnostics 诊断节点（只读）+ SendTestData/EchoTest
      方法 + --check-transmission 客户端检测，证明数据真的在传（不止端口通）。
   6. 智能诊断（v2.5）：--diagnose / GUI「智能诊断」一键收齐配置—服务—数据—传输—日志
      五层证据，逐项给通过/注意/失败与具体处理步骤（纯规则，离线可用，不用大模型）。
 
 用法：
-  server_app.py                      # 按同目录 config.json 启动 OPC UA 服务
+  server_app.py                      # 打开桌面主窗口，并按同目录 config.json 启动 OPC UA 服务
+  server_app.py --settings           # 打开桌面主窗口，但不自动启动服务（窗口里可手动启动）
   server_app.py --config 配置.json   # 指定配置文件
-  server_app.py --extract 数据文件夹 -o 输出文件夹 [--last 20]
+  server_app.py --extract 数据文件夹 -o 输出文件夹 [--last 20]   # 命令行工具（不开窗口）
   server_app.py --list 数据文件夹
-  server_app.py --gui                # 图形监控窗口（服务同时启动）
+  server_app.py --selftest
 
 OPC UA 地址空间（ns=<namespace index>，启动日志会打印实际值）：
   Objects/Chromatograph
@@ -61,22 +64,11 @@ __version__ = chrom_core.__version__
 
 def _force_utf8_stdout():
     """Windows 控制台默认编码（如 cp1252）写不下中文会直接崩溃；
-    程序输出大量中文，启动时就把 stdout/stderr 强制切到 UTF-8。
-    reconfigure 失败时（如流被替换/分离过）用底层 buffer 重新包一层，
-    保证后续 print 中文不崩（CI 上 test_selftest_passes 曾因此失败）。"""
-    for name in ("stdout", "stderr"):
-        stream = getattr(sys, name, None)
-        if stream is None:
-            continue
+    程序输出大量中文，启动时就把 stdout/stderr 强制切到 UTF-8。"""
+    for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-            continue
-        except Exception:
-            pass
-        try:
-            import io
-            setattr(sys, name, io.TextIOWrapper(
-                stream.buffer, encoding="utf-8", errors="replace", line_buffering=True))
+            if stream is not None:
+                stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
 
@@ -135,7 +127,55 @@ DEFAULT_CONFIG = {
     "allow_test_send": True,          # 是否允许客户端远程调用 SendTestData（仅写 Station_TEST 测试通道）
     "test_send_min_interval_sec": 5,  # 远程发送测试数据的最短间隔，防止被反复调用
     "transmission_stale_sec": 7200,   # 数据超过多少秒没更新视为"数据较旧"（Diagnostics.TransmissionStatus）
+    # ---- 桌面窗口（v3.0 新增；只影响本机窗口，不影响 OPC UA 服务）----
+    "desktop_notify": True,           # 新告警出现时：任务栏闪烁 + Windows 通知气泡
+    "desktop_notify_level": "all",    # all = 严重和警告都提醒 / critical = 只提醒严重
+    "desktop_notify_quiet": True,     # 静默时段（alert_quiet）内不弹桌面提醒
+    "desktop_auto_start_service": True,   # 打开窗口后自动启动服务（--settings 打开时一律不自动启动）
+    "desktop_start_minimized": False,     # 打开窗口时最小化（配合“登录后自动打开窗口”）
+    # ---- v3.1 新增 ----
+    "desktop_language": "auto",       # 界面语言：auto（按 Windows 系统界面语言）/ zh / en；日志与 OPC UA 节点名不翻译
+    "backup_keep": 10,                # 还原前自动备份（backups\自动备份_*.zip）保留最近几个
+    # 历史数据（服务运行期间写入 history/history.db，窗口里查询对比、运行报表统计用）
+    "history_enabled": True,
+    "history_file": "history/history.db",
+    "history_retention_days": 90,     # 保留天数，超过自动删除
+    "history_max_mb": 1024,           # 曲线数据容量上限（MB），超过从最旧的周期删起
+    # 峰识别（谱图预览标峰、峰表、可选发布到 OPC UA / Modbus）
+    "peak_min_height": 0.0,           # 最小峰高（0 = 只按噪声阈值）
+    "peak_min_width": 0.0,            # 最小半峰宽（秒）
+    "peak_noise_factor": 5.0,         # 阈值 = 噪声 × 倍数
+    "peak_smooth": 5,                 # 平滑点数
+    "peak_start": 0.0,                # 积分起点（秒）
+    "peak_end": 0.0,                  # 积分终点（秒，0 = 到最后）
+    "peak_series": "value",           # 用哪列数据找峰：value / uv / raw
+    "peaks_publish": False,           # 在每个通道下发布 Peaks 节点（RetentionTimes / Heights / Areas …）
+    "peaks_publish_max": 50,          # 最多发布几个峰
+    # Modbus TCP 数据转发（只读从站，随服务启停）
+    "modbus_server_enabled": False,
+    "modbus_server_host": "127.0.0.1",    # 默认只本机；改成 0.0.0.0 或网卡地址才对外（无认证，务必配白名单）
+    "modbus_server_port": 502,
+    "modbus_server_allow": [],        # 允许的来源 IP / 网段，空 = 不限制
+    "modbus_server_unit": 0,          # 站号，0 = 任意站号都应答
+    "modbus_server_order": "ABCD",    # 32 位数据的字节序：ABCD / CDAB / BADC / DCBA
+    "modbus_server_map": [],          # 寄存器映射表，在窗口“Modbus 转发”页编辑
+    # 运行报表（窗口内定时器生成，不建计划任务）
+    "desktop_report_auto": "off",     # off / daily（每天） / shift（每班）
+    "desktop_report_shifts": [{"name": "白班", "start": "08:00"}, {"name": "夜班", "start": "20:00"}],
+    "desktop_report_dir": "运行报表",
+    # 桌面窗口登录与权限（账号复用 users；角色：operator 操作员 / engineer 工程师 / admin 管理员）
+    "desktop_auth": True,             # 关闭后窗口不需要登录，所有操作都可用（不推荐）
+    "desktop_idle_lock_minutes": 15,  # 空闲多少分钟自动锁定（退回只读），0 = 不锁定
+    "user_roles": {},
 }
+
+# 桌面窗口自己的设置项：保存后窗口立即使用，与服务的热加载/重启无关
+DESKTOP_KEYS = ("desktop_notify", "desktop_notify_level", "desktop_notify_quiet",
+                "desktop_auto_start_service", "desktop_start_minimized",
+                "desktop_language", "desktop_report_auto", "desktop_report_shifts", "desktop_report_dir",
+                "desktop_auth", "desktop_idle_lock_minutes")
+DESKTOP_BOOL_KEYS = ("desktop_notify", "desktop_notify_quiet", "desktop_auto_start_service",
+                     "desktop_start_minimized", "desktop_auth")
 
 
 APP_URI = "urn:chromextract:opcua:server"   # 服务端应用 URI，必须与证书里一致
@@ -161,7 +201,7 @@ def setup_logging(cfg, base_dir, console=True):
     root.setLevel(logging.INFO)
     logging.getLogger("asyncua").setLevel(logging.WARNING)
     root.handlers = []
-    if console:                       # 后台模式不往控制台写（没有控制台，写了也白写）
+    if console and sys.stdout is not None:   # 窗口版 EXE 没有控制台，不往控制台写
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(fmt)
         root.addHandler(sh)
@@ -176,7 +216,7 @@ def setup_logging(cfg, base_dir, console=True):
 
 
 # ---------------------------------------------------------------------------
-# 数据快照：在后台线程扫描数据源，解析出最新谱图
+# 数据快照：在工作线程扫描数据源，解析出最新谱图
 # ---------------------------------------------------------------------------
 
 def _file_sig(path):
@@ -274,9 +314,17 @@ HOT_KEYS = ("users", "allow_anonymous", "remote_export", "export_min_interval_se
             "alert_email_to", "smtp_host", "smtp_port", "smtp_security", "smtp_user",
             "smtp_password", "smtp_from", "alert_webhook_level", "alert_email_level", "alert_quiet",
             "alert_channel_rules", "alert_probes", "env_check_hours",
-            "allow_test_send", "test_send_min_interval_sec", "transmission_stale_sec")
+            "allow_test_send", "test_send_min_interval_sec", "transmission_stale_sec",
+            # v3.1：峰识别参数、Modbus 映射 / 字节序、账号角色（服务每轮按新值计算）
+            "peak_min_height", "peak_min_width", "peak_noise_factor", "peak_smooth", "peak_start", "peak_end",
+            "peak_series", "peaks_publish_max", "modbus_server_map", "modbus_server_order", "user_roles",
+            "backup_keep")
 RESTART_KEYS = ("env_check_on_start", "endpoint", "security", "allow_insecure_fallback", "cert_dir",
-                "trusted_client_certs_dir", "max_connections", "namespace_uri", "server_name")
+                "trusted_client_certs_dir", "max_connections", "namespace_uri", "server_name",
+                # v3.1
+                "history_enabled", "history_file", "history_retention_days", "history_max_mb",
+                "peaks_publish", "modbus_server_enabled", "modbus_server_host", "modbus_server_port",
+                "modbus_server_allow", "modbus_server_unit")
 
 
 def _cfg_stamp(path):
@@ -321,7 +369,7 @@ def try_hot_reload(cfg, stamp, reload_cb=None):
     return now
 
 
-def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None, monitor=None):
+def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None, monitor=None, history_cb=None):
     """循环扫描数据源；发现新周期即通过回调推给 OPC UA 循环。"""
     last_sig = None
     cache = {}
@@ -344,6 +392,8 @@ def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None, mon
                 get_log().info("扫描到 %d 个检测器通道，其中 %d 个有更新", len(sig), new_cnt)
                 last_sig = sig
                 snapshot_cb(recs)
+                if history_cb is not None:
+                    history_cb(recs)
         except Exception as e:  # noqa
             get_log().error("扫描出错：%s", e)
             if monitor is not None:
@@ -359,6 +409,19 @@ def watcher_thread(snapshot_cb, stop_evt, cfg, beat_cb=None, reload_cb=None, mon
 # ---------------------------------------------------------------------------
 # OPC UA 服务
 # ---------------------------------------------------------------------------
+
+def _channel_key(r):
+    """通道键：来源|应用|流路|检测器（与 alerts / desktop_features / history 一致）。"""
+    return "%s|%s|%s|%s" % (r.get("source"), r.get("app"), r.get("stream"), r.get("det"))
+
+
+def _channel_label(r):
+    try:
+        import desktop_features as _df
+        return _df.channel_label(r, "zh")     # 历史库里固定存中文，界面显示时再翻译
+    except Exception:  # noqa
+        return _channel_key(r)
+
 
 def _safe_node(s):
     import re as _re
@@ -658,6 +721,12 @@ class OpcUaApp:
         self._total_points = 0
         self.n_diag = None
         self.diag_nodes = {}
+        # v3.1
+        self.history = None
+        self.modbus = None
+        self.peaks = {}                        # 通道键 -> [峰]（最新周期）
+        self._peak_cache = None
+        self._mb_ctx = None
 
     async def start(self):
         from asyncua import Server, ua
@@ -980,6 +1049,81 @@ class OpcUaApp:
                 await self.n_server_info.write_value(__version__)
             except Exception:  # noqa
                 pass
+        self.update_modbus()
+
+    # ---- v3.1：峰识别 / Modbus 转发 ----
+    def compute_peaks(self, r):
+        """最新周期的峰（按通道 + 周期号缓存）。参数取当前配置（热加载后立即按新参数算）。"""
+        import peaks as _peaks
+        if self._peak_cache is None:
+            self._peak_cache = _peaks.PeakCache()
+        params = _peaks.params_from_config(self.cfg)
+        series = self.cfg.get("peak_series", "value")
+        key = _channel_key(r)
+        return self._peak_cache.get(key, r.get("cycle_id"), params, series,
+                                    lambda: _peaks.peaks_for_record(r, params, series)["peaks"])
+
+    def _needs_peaks(self):
+        if self.cfg.get("peaks_publish"):
+            return True
+        return self.modbus is not None and any(str(m.get("field", "")).startswith("peak")
+                                               for m in self.cfg.get("modbus_server_map") or [])
+
+    def update_modbus(self, alert_snap=None):
+        if self.modbus is None:
+            return
+        import modbus_server as _mbs
+        try:
+            if self._mb_ctx is None:
+                self._mb_ctx = _mbs.Context()
+            if self._needs_peaks():
+                for r in self.latest_records:
+                    try:
+                        self.peaks[_channel_key(r)] = self.compute_peaks(r)
+                    except Exception:  # noqa
+                        pass
+            clients = self.client_count()
+            _mbs.update_context(self._mb_ctx, self.latest_records, alert_snap, self.peaks, clients, _channel_key)
+            self.modbus.update(_mbs.build_registers(self.cfg.get("modbus_server_map") or [], self._mb_ctx,
+                                                    self.cfg.get("modbus_server_order", "ABCD")))
+        except Exception as e:  # noqa
+            get_log().error("Modbus 转发寄存器更新失败：%s", e)
+
+    def client_count(self):
+        """当前 OPC UA 客户端连接数；取不到返回 None（不记录，避免把“取不到”记成 0）。"""
+        try:
+            import desktop_features as _df
+            res = _df.collect_sessions(self)
+            return int(res.get("count") or 0) if res.get("ok") else None
+        except Exception:  # noqa
+            return None
+
+    def after_alarms(self, snap):
+        """告警循环（每 15 秒）：记录告警出现 / 恢复和客户端连接数，刷新 Modbus 心跳与告警数。"""
+        clients = self.client_count()
+        if self.history is not None:
+            try:
+                self.history.track_alerts(snap)
+                self.history.track_clients(clients)
+            except Exception as e:  # noqa
+                get_log().error("历史事件写入失败：%s", e)
+        self.update_modbus(snap)
+
+    async def _write_peaks(self, r, n):
+        """在通道下发布 Peaks（节点名固定英文，不随界面语言变化）。"""
+        from asyncua import ua
+        import peaks as _peaks
+        try:
+            pk = self.compute_peaks(r)
+        except Exception as e:  # noqa
+            get_log().warning("峰识别失败（%s）：%s", r.get("source"), e)
+            pk = []
+        self.peaks[_channel_key(r)] = pk
+        arr = _peaks.opcua_arrays(pk, self.cfg.get("peaks_publish_max", 50))
+        dvt = ua.VariantType.Double
+        await n["pk_count"].write_value(ua.Variant(int(arr["Count"]), ua.VariantType.Int32))
+        for name in ("RetentionTimes", "Heights", "Areas", "AreaPercents", "Widths"):
+            await n["pk_" + name].write_value(ua.Variant(arr[name], dvt))
 
     async def _station(self, serial, source):
         name = "Station_" + _safe_node(serial or _safe_node(source))
@@ -1028,6 +1172,11 @@ class OpcUaApp:
                 app_name=await dev.add_variable(self.idx, "AppName", r["app_name"] or ""),
                 stream_name=await dev.add_variable(self.idx, "StreamName", r["stream_name"] or ""),
             )
+            if self.cfg.get("peaks_publish"):
+                pko = await dev.add_object(self.idx, "Peaks")
+                nodes["pk_count"] = await pko.add_variable(self.idx, "Count", ua.Variant(0, ua.VariantType.Int32))
+                for name in ("RetentionTimes", "Heights", "Areas", "AreaPercents", "Widths"):
+                    nodes["pk_" + name] = await pko.add_variable(self.idx, name, empty_f)
             self.devices[key] = nodes
             get_log().info("新增节点：%s / %s", "Chromatograph", dev_name)
         n = self.devices[key]
@@ -1054,6 +1203,8 @@ class OpcUaApp:
         await n["rev"].write_value(self.revision)
         await n["last"].write_value(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         await n["good"].write_value(True)
+        if "pk_count" in n:
+            await self._write_peaks(r, n)
 
 
 def _write_records_csv(records, outdir):
@@ -1130,8 +1281,32 @@ async def run_server(cfg, stop_evt=None):
     env_mon = envwatch.EnvWatch(cfg, monitor, log=get_log()).start()
     ALERTS["env"] = env_mon
     ALERTS["monitor"] = monitor
+    # v3.1：历史数据与运行事件（同一进程内，不新增后台进程）、Modbus TCP 转发
+    import history as _history
+    import modbus_server as _mbs
+    hist = _history.open_from_config(cfg, get_log())
+    app.history = hist
+    if hist is not None:
+        try:
+            hist.service_started()
+        except Exception as e:  # noqa
+            get_log().error("历史数据库写入失败：%s", e)
+    app.modbus = _mbs.start_from_config(cfg, get_log())
+    ALERTS["modbus"] = app.modbus
+
+    def history_cb(recs):
+        if hist is None:
+            return
+        try:
+            n = hist.record_records(recs, labeler=_channel_label)
+            if n:
+                get_log().info("历史数据：新记录 %d 个周期", n)
+        except Exception as e:  # noqa
+            get_log().error("历史数据写入失败：%s", e)
+
     th = threading.Thread(target=watcher_thread,
-                          args=(snapshot_cb, stop_flag, cfg, beat_cb, app.user_manager.reload, monitor),
+                          args=(snapshot_cb, stop_flag, cfg, beat_cb, app.user_manager.reload, monitor,
+                                history_cb),
                           daemon=True)
     th.start()
 
@@ -1141,7 +1316,9 @@ async def run_server(cfg, stop_evt=None):
             try:
                 monitor.evaluate()
                 notifier.tick(monitor.active_alerts())     # 静默结束后补发仍未恢复的告警
-                await app.write_alarms(monitor.snapshot())
+                snap = monitor.snapshot()
+                await app.write_alarms(snap)
+                app.after_alarms(snap)
             except Exception as e:  # noqa
                 get_log().error("告警检查出错：%s", e)
             try:
@@ -1163,6 +1340,15 @@ async def run_server(cfg, stop_evt=None):
         ALERTS.pop("env", None)
         ALERTS.pop("monitor", None)
         ALERTS.pop("probes", None)
+        ALERTS.pop("modbus", None)
+        if app.modbus is not None:
+            app.modbus.stop()
+        if hist is not None:
+            try:
+                hist.service_stopped()
+            except Exception:  # noqa
+                pass
+            hist.close()
         await app.server.stop()
         get_log().info("服务已停止")
 
@@ -2117,18 +2303,8 @@ def start_web_settings(cfg, open_browser=False):
 
 
 def run_settings_only(cfg):
-    """只打开桌面设置窗口（不启动 OPC UA 服务），关闭窗口结束。"""
-    import desktop_ui
-    note = ""
-    try:
-        import bgrun
-        running, _st, _msg = bgrun.read_status(cfg.get("_base_dir") or program_dir())
-        if running:
-            note = ("后台服务正在运行：本窗口只改设置，通道实时状态请看图形窗口"
-                    "（网页 http://127.0.0.1:%s/ 仍可用）" % cfg.get("web_port", 8840))
-    except Exception:  # noqa
-        pass
-    return desktop_ui.run_desktop(cfg, start_service=False, background_note=note)
+    """打开桌面主窗口但不自动启动 OPC UA 服务（窗口里可随时点“启动服务”），关闭窗口结束。"""
+    return run_gui(cfg, start_service=False)
 
 
 def _resource(rel):
@@ -2145,11 +2321,12 @@ def _set_window_icon(win):
         pass
 
 
-def run_gui(cfg):
-    """打开桌面窗口（服务同时启动）。v2.6 起网页设置界面改为桌面窗口，见 desktop_ui.py。"""
+def run_gui(cfg, start_service=True, minimized=False):
+    """打开桌面主窗口。start_service=True 时窗口打开后自动启动 OPC UA 服务（默认）。
+    服务运行在本进程的工作线程里，窗口关闭即停止，见 desktop_ui.py。"""
     _hide_own_console()
     import desktop_ui
-    return desktop_ui.run_desktop(cfg, start_service=True)
+    return desktop_ui.run_desktop(cfg, start_service=start_service, minimized=minimized)
 
 
 
@@ -2183,8 +2360,8 @@ def _hide_own_console():
 
 
 def _pause_before_exit(rc):
-    """双击 EXE 出错退出时停住窗口，让人看清原因。
-    计划任务/管道启动时 stdin 不是终端，不会停住，所以不影响开机自启和自动重启。"""
+    """双击命令行版 EXE 出错退出时停住窗口，让人看清原因。
+    被脚本/安装程序/管道调用时 stdin 不是终端，不会停住。"""
     if rc in (0, None) or not getattr(sys, "frozen", False):
         return
     try:
@@ -2534,13 +2711,15 @@ def run_stability_multi_cli(argv):
     return 0 if not any(r["fail"] for r in st["rows"]) else 1
 
 
-def run_selftest():
-    """--selftest：在临时目录造演示数据，启动真实的 OPC UA 服务，用客户端读一遍。
-    不碰 config.json，不占用 4840 端口。通过返回 0，失败返回 1。"""
-    _force_utf8_stdout()  # 测试可直接调用本函数（不经 main），cp1252 控制台也要能印中文
+def selftest_core():
+    """自检核心（命令行 --selftest 与桌面窗口「自检」按钮共用）：在临时目录造演示数据，
+    启动真实的 OPC UA 服务，用客户端读一遍，再检查 HTTPS 设置页面。
+    不碰 config.json，不占用 4840 端口。返回 (是否通过, 说明)。
+    注意：自检期间会临时占用全局 ALERTS / OpcUaApp.current，桌面窗口需先停止正式服务再调用。"""
     import shutil
     import socket
-    print("色谱提取 OPC UA 服务 v%s —— 自检开始（约需 10 秒）" % __version__)
+    root = logging.getLogger()
+    old_level = root.level
     tmp = tempfile.mkdtemp(prefix="chrom_selftest_")
     try:
         import demo_data
@@ -2555,7 +2734,7 @@ def run_selftest():
                    watch_dirs=[data], security="none", log_file="")
         cfg["_base_dir"], cfg["_cfg_path"] = tmp, None
         normalize_config(cfg, tmp)
-        logging.getLogger().setLevel(logging.ERROR)
+        root.setLevel(logging.ERROR)
         ok, msg = asyncio.run(_selftest_async(cfg, port))
         if ok:
             ok2, msg2 = _selftest_web(tmp)
@@ -2563,8 +2742,16 @@ def run_selftest():
     except Exception as e:  # noqa
         ok, msg = False, "%s: %s" % (type(e).__name__, e)
     finally:
+        root.setLevel(old_level)      # 恢复日志级别：桌面窗口里自检完日志窗还要继续显示
         shutil.rmtree(tmp, ignore_errors=True)
-    _force_utf8_stdout()  # 自检期间流可能被其它代码动过，打印结论前再强制一次
+    return ok, msg
+
+
+def run_selftest():
+    """--selftest：命令行自检。通过返回 0，失败返回 1。"""
+    _force_utf8_stdout()  # 测试可直接调用本函数（不经 main），cp1252 控制台也要能印中文
+    print("色谱提取 OPC UA 服务 v%s —— 自检开始（约需 10 秒）" % __version__)
+    ok, msg = selftest_core()
     print(("[ 通过 ] " if ok else "[ 失败 ] ") + msg)
     if ok:
         print("程序本身工作正常。如果现场仍读不到数据，问题在 config.json 的监控目录或网络/防火墙。")
@@ -2586,6 +2773,18 @@ def load_config(path):
 
 class ConfigError(Exception):
     pass
+
+
+def _cfg_bool(cfg, key):
+    """开关类配置：只接受 true/false（也容忍 0/1 和 "true"/"false" 等写法），其它值直接报错。"""
+    v = cfg.get(key, DEFAULT_CONFIG[key])
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str) and v.strip().lower() in ("true", "false", "1", "0", "yes", "no", "on", "off"):
+        return v.strip().lower() in ("true", "1", "yes", "on")
+    raise ConfigError("配置项 %s 只能是 true 或 false，当前为：%r" % (key, v))
 
 
 def _clamp_int(cfg, key, lo, hi):
@@ -2664,7 +2863,7 @@ def normalize_config(cfg, base_dir):
     if isinstance(dirs, str):
         dirs = [dirs]
     # 相对路径按"程序所在目录"解析，而不是启动时的当前目录
-    # （从快捷键/计划任务/服务启动时，当前目录常常是 C:\Windows\System32，会找不到数据）
+    # （从快捷方式/安装程序启动时，当前目录常常是 C:\Windows\System32，会找不到数据）
     cfg["watch_dirs"] = [d if os.path.isabs(d) else os.path.normpath(os.path.join(base_dir, d))
                          for d in map(str, dirs)]
     users = cfg.get("users") or {}
@@ -2679,8 +2878,93 @@ def normalize_config(cfg, base_dir):
     if not cfg.get("allow_anonymous", True) and not users:
         raise ConfigError("allow_anonymous=false 但没有配置任何 users，将没有人能连接。")
     cfg["allow_test_send"] = bool(cfg.get("allow_test_send", True))
+    # v3.0 桌面窗口设置
+    for k in DESKTOP_BOOL_KEYS:
+        cfg[k] = _cfg_bool(cfg, k)
+    lv = str(cfg.get("desktop_notify_level") or "all").strip().lower()
+    if lv not in ("all", "critical"):
+        raise ConfigError("desktop_notify_level 只能是 all / critical，当前为：%r" % lv)
+    cfg["desktop_notify_level"] = lv
+    _normalize_v31(cfg)
     chrom_core.set_limits(max_points=cfg["max_trace_points"], max_file_mb=cfg["max_file_mb"])
     return cfg
+
+
+def _clamp_float(cfg, key, lo, hi):
+    try:
+        v = float(cfg.get(key, DEFAULT_CONFIG[key]))
+    except (TypeError, ValueError):
+        raise ConfigError("配置项 %s 必须是数字，当前为：%r" % (key, cfg.get(key)))
+    if v != v or v in (float("inf"), float("-inf")):
+        raise ConfigError("配置项 %s 不能是无穷大或 NaN" % key)
+    cfg[key] = max(lo, min(hi, v))
+
+
+def _normalize_v31(cfg):
+    """v3.1 新配置项校验：界面语言、历史数据、峰识别、Modbus 转发、运行报表、桌面登录与角色。"""
+    import i18n
+    import modbus_server
+    import peaks as _peaks
+    import reports
+    import audit
+    try:
+        cfg["desktop_language"] = i18n.normalize_language(cfg.get("desktop_language", "auto"))
+    except ValueError as e:
+        raise ConfigError(str(e))
+    cfg["history_enabled"] = _cfg_bool(cfg, "history_enabled")
+    cfg["peaks_publish"] = _cfg_bool(cfg, "peaks_publish")
+    cfg["modbus_server_enabled"] = _cfg_bool(cfg, "modbus_server_enabled")
+    for key, lo, hi in (("history_retention_days", 1, 3650), ("history_max_mb", 10, 102400),
+                        ("peak_smooth", 1, 501), ("peaks_publish_max", 1, 500),
+                        ("modbus_server_port", 1, 65535), ("modbus_server_unit", 0, 255),
+                        ("desktop_idle_lock_minutes", 0, 1440), ("backup_keep", 1, 100)):
+        _clamp_int(cfg, key, lo, hi)
+    for key, lo, hi in (("peak_min_height", 0.0, 1e12), ("peak_min_width", 0.0, 3600.0),
+                        ("peak_noise_factor", 0.5, 1000.0), ("peak_start", 0.0, 1e6), ("peak_end", 0.0, 1e6)):
+        _clamp_float(cfg, key, lo, hi)
+    try:
+        _peaks.params_from_config(cfg)
+    except ValueError as e:
+        raise ConfigError("峰识别参数：%s" % e)
+    ps = str(cfg.get("peak_series") or "value").strip().lower()
+    if ps not in ("value", "uv", "raw"):
+        raise ConfigError("peak_series 只能是 value / uv / raw，当前为：%r" % ps)
+    cfg["peak_series"] = ps
+    hf = str(cfg.get("history_file") or "history/history.db").strip()
+    if any(c in hf for c in "\r\n\x00") or not hf.lower().endswith(".db"):
+        raise ConfigError("history_file 必须是 .db 文件路径，当前为：%r" % hf)
+    cfg["history_file"] = hf
+    host = str(cfg.get("modbus_server_host") or "127.0.0.1").strip()
+    import ipaddress
+    if host != "localhost":
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            raise ConfigError("modbus_server_host 必须是 IP 地址（例如 127.0.0.1 或 0.0.0.0），当前为：%r" % host)
+    cfg["modbus_server_host"] = host
+    order = str(cfg.get("modbus_server_order") or "ABCD").strip().upper()
+    if order not in modbus_server.ORDERS:
+        raise ConfigError("modbus_server_order 只能是 ABCD / CDAB / BADC / DCBA，当前为：%r" % order)
+    cfg["modbus_server_order"] = order
+    try:
+        cfg["modbus_server_allow"] = modbus_server.normalize_allow(cfg.get("modbus_server_allow"))
+        cfg["modbus_server_map"] = modbus_server.normalize_map(cfg.get("modbus_server_map"))
+    except ValueError as e:
+        raise ConfigError("Modbus 转发：%s" % e)
+    try:
+        cfg["desktop_report_auto"] = reports.normalize_mode(cfg.get("desktop_report_auto"))
+        cfg["desktop_report_shifts"] = reports.normalize_shifts(cfg.get("desktop_report_shifts"))
+    except ValueError as e:
+        raise ConfigError("运行报表：%s" % e)
+    rd = str(cfg.get("desktop_report_dir") or "运行报表").strip()
+    if any(c in rd for c in "\r\n\x00"):
+        raise ConfigError("desktop_report_dir 不能包含换行")
+    cfg["desktop_report_dir"] = rd
+    try:
+        # 已删除的账号的角色直接忽略（不报错，避免删账号后配置“坏掉”）
+        cfg["user_roles"] = audit.normalize_roles(cfg.get("user_roles"), cfg.get("users") or {})
+    except ValueError as e:
+        raise ConfigError("user_roles：%s" % e)
 
 
 def security_report(cfg):
@@ -2864,34 +3148,38 @@ def admin_menu(cfg_path):
             print("操作失败：%s" % e)
 
 
+# v2.9 起取消的后台运行方式：旧脚本/快捷方式还带着这些参数时给出明确说明，而不是 argparse 的英文报错
+REMOVED_ARGS = ("--background", "--status", "--stop", "--service", "--install-service",
+                "--uninstall-service", "--start-service", "--stop-service", "--service-status")
+REMOVED_NOTE = ("v2.9 起本程序改为桌面软件：已取消后台静默运行、Windows 服务和开机自启（参数 %s 不再可用）。\n"
+                "请双击 ChromExtractOPC.exe 打开主窗口，在窗口里启动/停止服务；关闭窗口即停止服务。\n"
+                "旧版本遗留的计划任务或 Windows 服务可运行 卸载.bat（管理员）清理。")
+
+
 def main(argv=None):
     _force_utf8_stdout()
-    ap = argparse.ArgumentParser(description="色谱提取 OPC UA 服务")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    legacy = [a for a in argv if a.split("=", 1)[0] in REMOVED_ARGS]
+    if legacy:
+        print(REMOVED_NOTE % "、".join(legacy))
+        return 2
+    ap = argparse.ArgumentParser(description="色谱提取 OPC UA 服务（桌面软件；带下列工具参数时只运行该工具、不开窗口）")
     ap.add_argument("--version", action="version", version="ChromExtractOPC %s" % __version__)
     ap.add_argument("--selftest", action="store_true",
                     help="自检：造演示数据、启动服务、用客户端读一遍（不影响现有配置）")
     ap.add_argument("--config", default=None, help="配置文件（默认：程序目录 config.json）")
-    ap.add_argument("--gui", action="store_true", help="打开桌面窗口（服务同时启动）")
-    ap.add_argument("--desktop", action="store_true", help="同 --gui：打开桌面窗口")
-    ap.add_argument("--background", action="store_true",
-                    help="后台静默运行：不显示任何窗口，日志只写 logs\\server.log；同一台电脑只运行一个实例")
-    ap.add_argument("--status", action="store_true", help="查看后台服务是否在运行")
-    ap.add_argument("--install-service", action="store_true",
-                    help="注册为 Windows 服务（管理员）：开机自动启动、崩溃自动重启，可在 services.msc 里启停")
-    ap.add_argument("--uninstall-service", action="store_true", help="停止并删除 Windows 服务（管理员）")
-    ap.add_argument("--start-service", action="store_true", help="启动 Windows 服务（管理员）")
-    ap.add_argument("--stop-service", action="store_true", help="停止 Windows 服务（管理员）")
-    ap.add_argument("--service-status", action="store_true", help="查看 Windows 服务状态")
-    ap.add_argument("--service", action="store_true", help=argparse.SUPPRESS)   # 仅供 Windows 服务管理器调用
-    ap.add_argument("--stop", action="store_true", help="让后台服务正常停止（20 秒没停才强制结束）")
-    ap.add_argument("--settings", action="store_true", help="只打开桌面设置窗口（不启动服务）")
+    ap.add_argument("--gui", action="store_true",
+                    help="打开桌面主窗口并自动启动服务（不带任何参数时的默认行为）")
+    ap.add_argument("--desktop", action="store_true", help="同 --gui：打开桌面主窗口")
+    ap.add_argument("--settings", action="store_true",
+                    help="打开桌面主窗口，但不自动启动服务（窗口里可点“启动服务”）")
     ap.add_argument("--stability", nargs="+", metavar="参数",
                     help="长时间稳定性测试，参数同 --nettest，另加 interval=秒 minutes=分钟，例如："
                          "--stability modbus_rtu port=COM3 baud=9600 unit=1 interval=1 minutes=60")
     ap.add_argument("--stability-multi", nargs="+", metavar="参数",
                     help="多目标稳定性测试：--stability-multi 目标.json [interval=秒] [minutes=分钟]；"
                          '目标.json 例如 [{"label":"GC-1","kind":"modbus_rtu","params":{"port":"COM3","unit":1}}, ...]')
-    ap.add_argument("--drivercheck", action="store_true", help="驱动与软件环境检测（串口驱动、运行库、防火墙、自启任务、数据目录）")
+    ap.add_argument("--drivercheck", action="store_true", help="驱动与软件环境检测（串口驱动、运行库、防火墙、端口、数据目录、旧版后台自启残留）")
     ap.add_argument("--nettest", nargs="+", metavar="参数",
                     help="连接测试，例如：--nettest ping 192.168.1.10 / --nettest tcp 192.168.1.10 4840 / "
                          "--nettest serial_list / --nettest modbus_rtu port=COM3 baud=9600 unit=1 "
@@ -2954,6 +3242,14 @@ def main(argv=None):
     ap.add_argument("--add-user", metavar="用户名", help="添加账号或重设密码（会提示输入密码）")
     ap.add_argument("--remove-user", metavar="用户名", help="删除账号")
     ap.add_argument("--list-users", action="store_true", help="列出账号")
+    ap.add_argument("--backup", metavar="文件", default=None,
+                    help="导出配置备份包（config.json、账号、证书与私钥、信任的客户端证书）到指定 .zip；"
+                         "配合 --encrypt 用密码加密（推荐），--with-logs 同时备份日志")
+    ap.add_argument("--restore", metavar="文件", default=None,
+                    help="从备份包还原配置（先校验并显示将覆盖的文件，确认后还原；还原前自动备份当前配置）")
+    ap.add_argument("--encrypt", action="store_true", help="配合 --backup：用密码加密备份包（会提示输入密码）")
+    ap.add_argument("--with-logs", action="store_true", help="配合 --backup / --restore：包含日志")
+    ap.add_argument("--yes", action="store_true", help="配合 --restore：不再询问，直接还原")
     ap.add_argument("--set-watch-dir", nargs="+", metavar="文件夹",
                     help="把数据目录（存放 *_V3.db / .mbd 的文件夹）写进配置文件")
     args = ap.parse_args(argv)
@@ -2974,25 +3270,6 @@ def main(argv=None):
 
     base_dir = program_dir()
     cfg_path = args.config or os.path.join(base_dir, "config.json")
-
-    if args.install_service or args.uninstall_service or args.start_service or args.stop_service \
-            or args.service_status:
-        return service_cli(args)
-
-    if args.status or args.stop:
-        import bgrun
-        if args.stop:
-            ok, msg = bgrun.request_stop(base_dir)
-            print(msg)
-            return 0 if ok else 1
-        running, st, msg = bgrun.read_status(base_dir)
-        print(msg)
-        if st:
-            for k, label in (("version", "版本"), ("endpoint", "OPC UA"), ("web", "设置页面"),
-                             ("heartbeat", "最近心跳"), ("log", "日志")):
-                if st.get(k):
-                    print("  %s：%s" % (label, st[k]))
-        return 0 if running else 3
 
     if args.admin or args.harden or args.add_user or args.remove_user or args.list_users:
         try:
@@ -3016,6 +3293,11 @@ def main(argv=None):
         except config_tools.ConfigToolError as e:
             print("操作失败：%s" % e)
             return 2
+
+    if args.backup:
+        return run_backup_cli(args.backup, base_dir, cfg_path, args.encrypt, args.with_logs)
+    if args.restore:
+        return run_restore_cli(args.restore, base_dir, cfg_path, args.with_logs, args.yes)
 
     if args.set_watch_dir:
         try:
@@ -3053,11 +3335,12 @@ def main(argv=None):
     try:
         normalize_config(cfg, base_dir)
     except ConfigError as e:
-        print("配置有误（%s）：\n  %s" % (cfg_path, e))
+        msg = "配置有误（%s）：\n  %s" % (cfg_path, e)
+        print(msg)
+        if _wants_window(args):
+            show_error_dialog("配置有误", msg + "\n\n请用记事本修改 config.json（修改前会自动备份为 config.json.bak），"
+                                          "或删除 config.json 后重新打开程序使用默认配置。")
         return 2
-
-    if args.settings:
-        return run_settings_only(cfg)
 
     if args.drivercheck:
         import drivercheck
@@ -3102,171 +3385,172 @@ def main(argv=None):
         chrom_core.extract(args.extract, args.out, last=args.last)
         return 0
 
-    # Windows 服务管理器启动：交给服务宿主，内部按后台模式运行
-    if args.service:
-        return run_windows_service(cfg, base_dir, cfg_path)
-    return serve(cfg, base_dir, cfg_path, mode="background" if args.background else ("gui" if (args.gui or args.desktop) else "console"))
+    # 没有任何工具参数：打开桌面主窗口（--settings 时不自动启动服务）
+    return run_desktop_app(cfg, base_dir, cfg_path, start_service=not args.settings)
 
 
-def service_cli(args):
-    import winservice
-    exe = sys.executable if getattr(sys, "frozen", False) else None
-    try:
-        if args.service_status:
-            info = winservice.query()
-            print(winservice.describe(info))
-            if info and info.get("path"):
-                print("  程序：%s" % info["path"])
-            return 0 if info and info["state"] == 4 else 3
-        if not winservice.is_admin():
-            print("需要管理员权限：请右键“以管理员身份运行”（或在管理员命令行里执行）。")
-            return 5
-        if args.install_service:
-            if exe is None:
-                print("请用打包好的 ChromExtractOPC.exe 注册服务（源码运行时没有可执行文件）。")
+def _backup_password_from_env():
+    return os.environ.get("CHROMEXTRACT_BACKUP_PASSWORD") or None
+
+
+def run_backup_cli(out, base_dir, cfg_path, encrypt=False, with_logs=False, password=None):
+    """命令行导出备份：--backup 文件 [--encrypt] [--with-logs]。
+    密码：环境变量 CHROMEXTRACT_BACKUP_PASSWORD（脚本用），否则提示输入两次。"""
+    import backup_tools
+    pw = None
+    if encrypt:
+        pw = password or _backup_password_from_env()
+        if not pw:
+            pw = getpass.getpass("设置备份密码（至少 8 位）：")
+            if len(pw) < 8:
+                print("密码太短：至少 8 个字符。")
                 return 2
-            import bgrun
-            running, st, _ = bgrun.read_status(program_dir())
-            if running and (st or {}).get("mode") != "service":
-                # 已有手动/计划任务启动的后台实例：先停掉，否则服务因单实例启动失败
-                print("检测到后台服务正在运行，先停止它……")
-                print("  " + bgrun.request_stop(program_dir())[1])
-            for line in winservice.install(exe):
-                print("  ✓ " + line)
-            print(winservice.start())
-            print(winservice.describe(winservice.query()))
-            return 0
-        if args.uninstall_service:
-            print(winservice.uninstall())
-            return 0
-        if args.start_service:
-            print(winservice.start())
-            return 0
-        print(winservice.stop())
-        return 0
-    except winservice.ServiceError as e:
-        print("操作失败：%s" % e)
-        return 1
-
-
-def serve(cfg, base_dir, cfg_path, mode="console", ctl=None):
-    """运行服务直到停止。mode：console / background / gui / service。
-    ctl：服务模式下传入 {"started": Event}，返回前会放入 "stop"（线程安全的停止函数）。"""
-    background = mode in ("background", "service")
-    # 同一台电脑只允许一个实例，避免抢端口、重复告警
-    import bgrun
-    instance = bgrun.SingleInstance(base_dir)
-    if not instance.acquire():
-        setup_logging(cfg, base_dir, console=not background)
-        get_log().warning("服务已经在运行（同一台电脑只运行一个实例），本次启动已退出。"
-                          "查看状态：ChromExtractOPC.exe --status")
-        _, st, _ = bgrun.read_status(base_dir)
-        url = (st or {}).get("web") or "http://127.0.0.1:%s/" % cfg.get("web_port", 8840)
-        if mode == "gui":
-            # 后台服务已在运行：窗口模式不再另起一个服务，直接打开桌面设置窗口
-            return run_settings_only(cfg)
-        elif mode == "console":
-            print("服务已经在运行（后台）。设置页面：%s" % url)
-        # Windows 服务：另一个实例（如手动后台启动的）占着，服务这次启动失败，由 SCM 记录
-        return 5 if mode == "service" else 0
-    if mode == "background":
-        bgrun.go_silent()
-    if background:
-        cfg["_background"] = True
-    setup_logging(cfg, base_dir, console=not background)
-    get_log().info("色谱提取 OPC UA 服务 v%s 启动（%s），配置：%s", __version__,
-                   {"background": "后台静默", "service": "Windows 服务", "gui": "窗口"}.get(mode, "控制台"), cfg_path)
-    for lv, msg in security_report(cfg):
-        if lv != "正常":
-            get_log().warning("安全提示[%s]：%s", lv, msg)
-    for w in watch_dir_warnings(cfg):
-        get_log().warning("数据目录提示：%s", w)
-    if mode == "gui":
-        try:
-            run_gui(cfg)
-        finally:
-            instance.release()
-        return 0
-    web_srv = start_web_settings(cfg)
-    if web_srv is not None:
-        cfg["_web_url"] = web_srv.url()
-
-    async def _run():
-        stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        request_stop = lambda: loop.call_soon_threadsafe(stop.set)   # noqa: E731
-        if ctl is not None:
-            ctl["stop"] = request_stop
-        web = cfg.get("_web_url") or "http://127.0.0.1:%s/" % cfg.get("web_port", 8840)
-        keeper = bgrun.StatusKeeper(base_dir, {
-            "version": __version__, "endpoint": cfg["endpoint"], "web": web, "mode": mode,
-            "log": os.path.join(base_dir, cfg.get("log_file") or "")},
-            stop_cb=request_stop).start()
-        if mode != "service":
-            import signal
-            for sig in ("SIGINT", "SIGTERM"):
-                if hasattr(signal, sig):
-                    try:
-                        loop.add_signal_handler(getattr(signal, sig), stop.set)
-                    except NotImplementedError:
-                        pass
-        if ctl is not None and ctl.get("started") is not None:
-            ctl["started"].set()
-            if ctl.get("want_stop"):
-                stop.set()
-        try:
-            await run_server(cfg, stop)
-        finally:
-            keeper.close()
-            if web_srv is not None:
-                try:
-                    web_srv.stop()
-                except Exception:  # noqa
-                    pass
-
+            if getpass.getpass("再输入一次：") != pw:
+                print("两次输入不一致。")
+                return 2
     try:
-        asyncio.run(_run())
-    except KeyboardInterrupt:
-        pass
-    except OSError as e:
-        # 最常见：端口已被占用（上一个实例没关，或别的程序在用 4840）
-        get_log().error("服务无法启动：%s。请检查 %s 的端口是否被占用（可在 config.json 改 endpoint 端口）。",
-                        e, cfg["endpoint"])
-        return 3
-    except RuntimeError as e:
-        get_log().error("服务无法启动：%s", e)
-        return 4
-    finally:
-        instance.release()
-    get_log().info("服务已退出（%s）", {"service": "Windows 服务", "background": "后台"}.get(mode, mode))
+        plan = backup_tools.plan_export(base_dir, cfg_path, with_logs)
+        if plan["private_keys"] and not pw:
+            print("警告：备份里包含证书私钥（%s），而备份包没有加密。"
+                  "请妥善保管，或加 --encrypt 用密码加密。" % "、".join(plan["private_keys"]))
+        r = backup_tools.export_backup(out, base_dir, cfg_path, password=pw, include_logs=with_logs)
+    except (backup_tools.BackupError, OSError, ValueError) as e:
+        print("备份失败：%s" % e)
+        return 2
+    print("已导出备份：%s（%d 个文件，%s）" % (r["path"], r["files"], "已加密" if r["encrypted"] else "未加密"))
+    for w in r["warnings"]:
+        print("注意：%s" % w)
     return 0
 
 
-def run_windows_service(cfg, base_dir, cfg_path):
-    """由 Windows 服务管理器以 --service 启动。"""
-    import winservice
-    ctl = {"started": threading.Event()}
-
-    def on_stop():
-        ctl["want_stop"] = True    # 还在启动中就被要求停止：服务一起来马上退出
-        fn = ctl.get("stop")
-        if fn is not None:
-            fn()
+def run_restore_cli(path, base_dir, cfg_path, with_logs=False, yes=False, password=None):
+    """命令行还原：--restore 文件 [--with-logs] [--yes]。加密包的密码同上（环境变量或提示输入）。"""
+    import backup_tools
+    pw = password or _backup_password_from_env()
+    validate = backup_tools.make_validator(sys.modules[__name__], base_dir)
     try:
-        return winservice.run_as_service(lambda: serve(cfg, base_dir, cfg_path, mode="service", ctl=ctl),
-                                         on_stop, ctl["started"], log=get_log())
-    except winservice.ServiceError as e:
-        print(e)
+        try:
+            info = backup_tools.inspect_backup(path, base_dir, cfg_path, pw, with_logs)
+        except backup_tools.PasswordRequired:
+            pw = getpass.getpass("备份包已加密，请输入密码：")
+            info = backup_tools.inspect_backup(path, base_dir, cfg_path, pw, with_logs)
+        print(backup_tools.summary_text(info))
+        if not yes:
+            ans = input("确定还原吗？还原前会自动备份当前配置。输入 y 确认：").strip().lower()
+            if ans not in ("y", "yes"):
+                print("已取消。")
+                return 1
+        r = backup_tools.restore_backup(path, base_dir, cfg_path, pw, with_logs, validate=validate,
+                                        keep=load_config(cfg_path).get("backup_keep", 10))
+    except (backup_tools.BackupError, OSError, ValueError) as e:
+        print("还原失败：%s" % e)
         return 2
+    print("已还原 %d 个文件。还原前的配置已自动备份到：%s" % (len(r["written"]), r["auto_backup"] or "（无）"))
+    if r["smtp_cleared"]:
+        print("SMTP 密码来自另一台电脑，已清空：请在窗口“告警与通知”里重新填写。")
+    print("请重启服务（在桌面窗口点“重启服务”，或关闭后重新打开程序）让证书和端口等设置生效。")
+    return 0
+
+
+def _wants_window(args):
+    """这次启动是不是要开桌面窗口（而不是只跑某个命令行工具）。"""
+    return not (args.drivercheck or args.check_security or args.check_transmission is not None
+                or args.diagnose or args.list_serial or args.diagnose_485 or args.list or args.extract)
+
+
+def show_error_dialog(title, text):
+    """窗口版 EXE 没有控制台：启动阶段的错误用对话框告诉用户。无图形环境时静默跳过。"""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        r = tk.Tk()
+        r.withdraw()
+        _set_window_icon(r)
+        messagebox.showerror(title, text, parent=r)
+        r.destroy()
+    except Exception:  # noqa
+        pass
+
+
+def show_info_dialog(title, text):
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        r = tk.Tk()
+        r.withdraw()
+        _set_window_icon(r)
+        messagebox.showinfo(title, text, parent=r)
+        r.destroy()
+    except Exception:  # noqa
+        pass
+
+
+def run_desktop_app(cfg, base_dir, cfg_path, start_service=True):
+    """桌面软件主流程：单实例检查 → 日志 → 启动提示 → 打开主窗口（窗口里控制服务启停）。
+    服务只在窗口存在期间运行：关闭窗口 = 停止服务，没有任何后台/常驻进程。"""
+    import instance_lock
+    instance = instance_lock.SingleInstance(base_dir)
+    if not instance.acquire():
+        msg = ("色谱提取 OPC UA 服务已经打开了一个窗口（同一台电脑只运行一个，避免抢占端口 %s）。\n"
+               "请在任务栏找到已打开的窗口。" % cfg.get("endpoint"))
+        print(msg)
+        show_info_dialog("程序已在运行", msg)
+        return 0
+    try:
+        setup_logging(cfg, base_dir)
+        get_log().info("色谱提取 OPC UA 服务 v%s 桌面窗口打开，配置：%s", __version__, cfg_path)
+        for lv, msg in security_report(cfg):
+            if lv != "正常":
+                get_log().warning("安全提示[%s]：%s", lv, msg)
+        for w in watch_dir_warnings(cfg):
+            get_log().warning("数据目录提示：%s", w)
+        # v3.0：“打开窗口后自动启动服务”“启动时最小化”两个桌面选项
+        import desktop_features
+        start_service, minimized = desktop_features.startup_behavior(cfg, start_service)
+        if not start_service and cfg.get("desktop_auto_start_service", True) is False:
+            get_log().info("已设置“打开窗口后不自动启动服务”：需要时点窗口上方“启动服务”")
+        return run_gui(cfg, start_service=start_service, minimized=minimized)
+    finally:
+        instance.release()
+
+
+# 打开窗口的参数（其余以 - 开头的参数都表示“只运行命令行工具”）
+WINDOW_ARGS = ("--gui", "--desktop", "--settings", "--config")
+# 需要控制台交互（输入密码 / Ctrl+C 结束）的工具：窗口版 EXE 没有控制台，提示改用命令行版
+CONSOLE_ONLY_ARGS = ("--admin", "--harden", "--add-user", "--hash-password", "--modbus-slave", "--poll-seconds",
+                     "--restore", "--encrypt")
+CLI_EXE = "ChromExtractOPC-cli.exe"
+
+
+def _is_tool_invocation(argv):
+    return any(a.startswith("-") and a.split("=", 1)[0] not in WINDOW_ARGS for a in argv)
 
 
 def _entry():
-    """程序入口：统一兜住未预期的错误，并在双击出错时停住窗口。"""
+    """程序入口：统一兜住未预期的错误。
+    - 窗口版 EXE（PyInstaller --windowed，没有控制台）：不带参数 = 打开桌面主窗口；
+      带工具参数时把输出收集起来，结束后用对话框显示（脚本请用命令行版 ChromExtractOPC-cli.exe）。
+    - 命令行版 EXE / 源码运行：输出照常打印；双击出错时停住窗口。"""
     rc = 0
     # 安装程序等自动调用时加 --no-pause：出错也不停住等回车（否则隐藏窗口会一直卡住）
-    no_pause = "--no-pause" in sys.argv or "--background" in sys.argv or "--service" in sys.argv
-    if "--no-pause" in sys.argv:
+    no_pause = "--no-pause" in sys.argv
+    if no_pause:
         sys.argv = [x for x in sys.argv if x != "--no-pause"]
+    argv = sys.argv[1:]
+    windowed = sys.stdout is None
+    captured = None
+    if windowed:
+        import io
+        if _is_tool_invocation(argv):
+            if any(a.split("=", 1)[0] in CONSOLE_ONLY_ARGS for a in argv):
+                show_error_dialog("请使用命令行版",
+                                  "这个功能需要在命令行窗口里输入或按 Ctrl+C 结束，窗口版程序无法使用。\n"
+                                  "请在命令提示符里运行：%s %s\n（或双击 安全管理.bat）" % (CLI_EXE, " ".join(argv)))
+                return 2
+            captured = io.StringIO()
+            sys.stdout = sys.stderr = captured
+        else:
+            sys.stdout = sys.stderr = open(os.devnull, "w", encoding="utf-8")
     try:
         rc = main()
     except SystemExit as e:
@@ -3278,7 +3562,7 @@ def _entry():
         tb = traceback.format_exc()
         try:
             print("程序遇到未预期的错误：\n" + tb)
-        except Exception:  # noqa  后台模式没有控制台
+        except Exception:  # noqa  没有控制台
             pass
         try:
             logging.getLogger("chrom").error("程序遇到未预期的错误，已退出：%s", tb.strip().splitlines()[-1])
@@ -3291,8 +3575,17 @@ def _entry():
                 f.write("%s\n%s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), tb))
         except Exception:  # noqa
             pass
+        if windowed and captured is None:
+            show_error_dialog("程序出错", "程序遇到未预期的错误，已退出。详情见 logs\\crash.log：\n\n" +
+                              tb.strip().splitlines()[-1])
         rc = 1
-    if not no_pause:
+    if captured is not None:
+        text = captured.getvalue().strip() or "（没有输出）"
+        if len(text) > 3000:
+            text = "……\n" + text[-3000:]
+        text += "\n\n退出代码：%s。需要在脚本里使用时请改用 %s。" % (rc, CLI_EXE)
+        (show_info_dialog if rc in (0, None) else show_error_dialog)("色谱提取 OPC UA 服务", text)
+    elif not no_pause and not windowed:
         _pause_before_exit(rc)
     return rc
 

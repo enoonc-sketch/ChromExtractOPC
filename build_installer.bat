@@ -4,8 +4,11 @@ setlocal
 cd /d "%~dp0"
 rem 生成安装程序 dist-installer\ChromExtractOPC-Setup-版本.exe
 rem 需要：先运行 build_exe.bat；安装 Inno Setup 6.3 以上（自带简体中文） https://jrsoftware.org/isdl.php
-if not exist dist\ChromExtractOPC.exe (
-  echo 找不到 dist\ChromExtractOPC.exe，请先双击 build_exe.bat 打包。
+set "MISSING="
+if not exist dist\ChromExtractOPC.exe set "MISSING=1"
+if not exist dist\ChromExtractOPC-cli.exe set "MISSING=1"
+if defined MISSING (
+  echo 找不到 dist\ChromExtractOPC.exe 或 dist\ChromExtractOPC-cli.exe，请先双击 build_exe.bat 打包。
   pause
   exit /b 1
 )
@@ -23,7 +26,7 @@ if not defined ISCC (
   exit /b 1
 )
 set "VER=0"
-for /f "tokens=2" %%v in ('dist\ChromExtractOPC.exe --version') do set "VER=%%v"
+for /f "tokens=2" %%v in ('dist\ChromExtractOPC-cli.exe --version') do set "VER=%%v"
 echo 生成安装程序 v%VER% ...
 set "SIGNARGS="
 powershell -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Check

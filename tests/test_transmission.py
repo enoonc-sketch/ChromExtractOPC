@@ -131,8 +131,8 @@ class _Server:
         self.cfg_path = os.path.join(self.dir, "config.json")
         with open(self.cfg_path, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False)
-        self.proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "server_app.py"),
-                                      "--config", self.cfg_path],
+        self.proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "tests", "server_runner.py"),
+                                      self.cfg_path],
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         self._wait_ready()
 

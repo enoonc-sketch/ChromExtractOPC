@@ -46,5 +46,47 @@
   "env_check_hours": 6,
   "allow_test_send": true,
   "test_send_min_interval_sec": 5,
-  "transmission_stale_sec": 7200
+  "transmission_stale_sec": 7200,
+  "desktop_notify": true,
+  "desktop_notify_level": "all",
+  "desktop_notify_quiet": true,
+  "desktop_auto_start_service": true,
+  "desktop_start_minimized": false,
+  "desktop_language": "auto",
+  "backup_keep": 10,
+  "history_enabled": true,
+  "history_file": "history/history.db",
+  "history_retention_days": 90,
+  "history_max_mb": 1024,
+  "peak_min_height": 0.0,
+  "peak_min_width": 0.0,
+  "peak_noise_factor": 5.0,
+  "peak_smooth": 5,
+  "peak_start": 0.0,
+  "peak_end": 0.0,
+  "peak_series": "value",
+  "peaks_publish": false,
+  "peaks_publish_max": 50,
+  "modbus_server_enabled": false,
+  "modbus_server_host": "127.0.0.1",
+  "modbus_server_port": 502,
+  "modbus_server_allow": [],
+  "modbus_server_unit": 0,
+  "modbus_server_order": "ABCD",
+  "modbus_server_map": [],
+  "desktop_report_auto": "off",
+  "desktop_report_shifts": [
+    {
+      "name": "白班",
+      "start": "08:00"
+    },
+    {
+      "name": "夜班",
+      "start": "20:00"
+    }
+  ],
+  "desktop_report_dir": "运行报表",
+  "desktop_auth": true,
+  "desktop_idle_lock_minutes": 15,
+  "user_roles": {}
 }

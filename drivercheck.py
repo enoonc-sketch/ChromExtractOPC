@@ -8,7 +8,8 @@ drivercheck.py —— 驱动与软件环境检测（只读，不安装、不修�
      常见 USB 转 485/232 芯片识别（CH340/CH341、FTDI、CP210x、PL2303 等），PL2303 假芯片/老驱动提示；
   2. 未安装驱动的设备：设备管理器里"其他设备"中与串口相关的未知设备；
   3. 程序运行环境：Python 库 asyncua / cryptography / pyserial 是否可用及版本；
-  4. 系统组件：Windows 防火墙服务、开机自启计划任务、监听端口是否被占用；
+  4. 系统组件：Windows 防火墙服务、监听端口是否被占用；旧版本（v2.8 及以前）遗留的开机自启计划任务 /
+     Windows 服务（v2.9 起为桌面软件，不再后台运行，残留会占用端口，提示清理）；
   5. 数据目录：监控目录是否可访问、是否有数据文件。
 
 Windows 上通过系统自带 PowerShell 查询（Get-PnpDevice / Win32_PnPSignedDriver），参数固定，不拼接用户输入。
@@ -67,13 +68,12 @@ _PS_SYSTEM = r"""
 $ErrorActionPreference = 'SilentlyContinue'
 $fw = Get-Service -Name MpsSvc
 $task = Get-ScheduledTask -TaskName 'ChromExtractOPC'
-$info = $null; if ($task) { $info = $task | Get-ScheduledTaskInfo }
+$svc = Get-Service -Name 'ChromExtractOPC'
 $os = Get-CimInstance Win32_OperatingSystem
 [pscustomobject]@{
   fw = $(if ($fw) { [string]$fw.Status } else { '' });
   task = $(if ($task) { [string]$task.State } else { '' });
-  task_last = $(if ($info -and $info.LastRunTime) { $info.LastRunTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' });
-  task_result = $(if ($info) { $info.LastTaskResult } else { $null });
+  svc = $(if ($svc) { [string]$svc.Status } else { '' });
   os = $(if ($os) { $os.Caption + ' ' + $os.Version } else { '' })
 } | ConvertTo-Json -Compress
 """
@@ -196,6 +196,8 @@ def check_system(cfg=None, runner=None):
     cfg = cfg or {}
     try:
         info = _ps(_PS_SYSTEM, runner) or {}
+        if not isinstance(info, dict):
+            info = {}
     except Exception as e:  # noqa
         info = {}
         items.append(_item("系统信息", "注意", "无法查询系统服务：%s" % e))
@@ -205,16 +207,17 @@ def check_system(cfg=None, runner=None):
     if fw:
         items.append(_item("Windows 防火墙服务", "正常" if fw == "Running" else "注意",
                            "状态：%s。" % fw, "" if fw == "Running" else "防火墙服务未运行，设置防火墙.bat 的来源限制不会生效。"))
-    task = info.get("task")
-    if os.name == "nt" or task:
-        if task:
-            res = info.get("task_result")
-            ok_res = res in (0, 267009, None)          # 267009 = 正在运行
-            items.append(_item("开机自启任务", "正常" if ok_res else "注意",
-                               "已安装，状态 %s%s。" % (task, "，上次运行 %s" % info["task_last"] if info.get("task_last") else ""),
-                               "" if ok_res else "上次运行结果代码 %s，请查看 logs\\server.log 和 logs\\crash.log。" % res))
-        else:
-            items.append(_item("开机自启任务", "注意", "没有安装开机自启。", "需要开机自动运行时，以管理员身份运行 安装开机自启.bat。"))
+    # v2.9 起是桌面软件：不再有开机自启/Windows 服务。旧版本留下的残留会在后台占用端口，提示清理。
+    leftovers = []
+    if info.get("task"):
+        leftovers.append("开机自启计划任务 ChromExtractOPC（状态 %s）" % info["task"])
+    if info.get("svc"):
+        leftovers.append("Windows 服务 ChromExtractOPC（状态 %s）" % info["svc"])
+    if leftovers:
+        items.append(_item("旧版后台运行残留", "注意", "检测到旧版本留下的%s。" % "、".join(leftovers),
+                           "本版本只以桌面窗口运行。请右键 卸载.bat 以管理员身份运行清理（程序和配置不会删除），"
+                           "或在管理员命令行执行：schtasks /Delete /TN ChromExtractOPC /F 和 sc delete ChromExtractOPC。"
+                           "残留的后台实例会占用 OPC UA 端口，导致桌面窗口里的服务启动失败。"))
     ep = str(cfg.get("endpoint") or "")
     try:
         port = int(ep.rsplit(":", 1)[1].split("/")[0])
@@ -240,7 +243,7 @@ def check_data_dirs(cfg=None):
         return [_item("数据目录", "问题", "没有设置监控目录。", "在设置页面“数据源”里填写存放 *_V3.db / *.mbd 的文件夹。")]
     for d in dirs:
         if not os.path.isdir(d):
-            items.append(_item("数据目录", "问题", "找不到：%s" % d, "检查路径；网络盘请确认已连接，服务以 SYSTEM 运行时看不到个人映射的盘符，请改用 \\\\服务器\\共享 路径。"))
+            items.append(_item("数据目录", "问题", "找不到：%s" % d, "检查路径；网络盘请确认已连接并在当前登录账号下可以打开（也可改用 \\\\服务器\\共享 路径）。"))
             continue
         try:
             names = os.listdir(d)

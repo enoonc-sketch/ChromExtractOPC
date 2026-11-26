@@ -155,6 +155,18 @@ def _smtp_hint(e):
     return str(e)
 
 
+_PAGE_DICT = {}
+
+
+def page_dictionary():
+    """网页用的翻译字典（JSON，已转义 </ 防止提前结束 script）。"""
+    import i18n
+    if _PAGE_DICT.get("n") != len(i18n.EN):
+        _PAGE_DICT["n"] = len(i18n.EN)
+        _PAGE_DICT["json"] = json.dumps(i18n.EN, ensure_ascii=False).replace("</", "<\\/")
+    return _PAGE_DICT["json"]
+
+
 class _Catch:
     """把推送时的错误日志收集起来，直接显示在网页上。"""
 
@@ -367,7 +379,7 @@ class SettingsServer:
             msg = "多目标稳定性测试已开始：%d 个目标，每 %g 秒，共 %g 分钟。" % (len(run.runs), run.interval, run.duration / 60)
             for port, n in run.shared_ports().items():
                 msg += " %s 上的 %d 个目标会按顺序轮询。" % (port, n)
-            return msg + " 可以关掉页面，测试会在后台继续。"
+            return msg + " 测试在程序里继续运行（关闭桌面主窗口会停止测试）。"
         try:
             run = stability.StabilityRun(str(body.get("kind") or ""), body.get("params") or {},
                                          body.get("interval"), body.get("minutes"),
@@ -375,7 +387,7 @@ class SettingsServer:
         except stability.StabilityError as e:
             raise config_tools.ConfigToolError(str(e))
         self.stab = run.start()
-        return "稳定性测试已开始：%s %s，每 %g 秒一次，共 %g 分钟。可以关掉页面，测试会在后台继续。" % (
+        return "稳定性测试已开始：%s %s，每 %g 秒一次，共 %g 分钟。测试在程序里继续运行（关闭桌面主窗口会停止测试）。" % (
             run.stats()["kind_name"], run.target(), run.interval, run.duration / 60)
 
     def stab_status(self):
@@ -407,7 +419,62 @@ class SettingsServer:
                 "worst": "正常", "quiet": _al.quiet_status(q),
                 "quiet_list": [dict(it, text=_al.describe_quiet(it)) for it in q]}
 
-    def handle_action(self, action, body):
+    def handle_action(self, action, body, actor=None):
+        """执行动作并写审计日志（logs/audit.log，带哈希链）。actor 形如 "web:用户名" / "desktop:用户名"。"""
+        import audit as _audit
+        actor = actor or "web"
+        source = actor.split(":", 1)[0] if ":" in actor else actor
+        user = actor.split(":", 1)[1] if ":" in actor else actor
+        try:
+            before = config_tools.read_raw(self.cfg_path)
+        except Exception:  # noqa
+            before = {}
+        log = _audit.get_log(os.path.join(self.base_dir, "logs", "audit.log"))
+        target = action
+        if action == "save":
+            target = ",".join(sorted((body.get("settings") or {}).keys()))[:200]
+        elif action in ("add_user", "remove_user", "harden"):
+            target = str(body.get("name") or "")
+        try:
+            res = self._handle_action(action, body)
+        except Exception as e:  # noqa
+            try:
+                log.record(user, action, target, source=source, ok=False, detail=str(e))
+            except Exception:  # noqa
+                pass
+            raise
+        try:
+            after = config_tools.read_raw(self.cfg_path)
+            ch = _audit.diff(before, after)
+            log.record(user, action, target, {k: v[0] for k, v in ch.items()} or None,
+                       {k: v[1] for k, v in ch.items()} or None, source=source, ok=True,
+                       detail=(res.get("summary", "") if isinstance(res, dict) else str(res))[:300])
+        except Exception as e:  # noqa
+            if self.log:
+                self.log.error("审计日志写入失败：%s", e)
+        return res
+
+    def page(self):
+        """设置页 HTML：注入防 CSRF 令牌、中英文字典（与桌面窗口同一份 i18n.EN）和默认语言。"""
+        try:
+            lang = str(config_tools.read_raw(self.cfg_path).get("desktop_language") or "auto").lower()
+        except Exception:  # noqa
+            lang = "auto"
+        if lang not in ("zh", "en", "auto"):
+            lang = "auto"
+        return (PAGE.replace("__TOKEN__", self.token).replace("__I18N__", page_dictionary())
+                .replace("__LANG__", lang))
+
+    def auth_user(self, header):
+        """网页登录的用户名（本机免登录时为空）。"""
+        if not self.need_login or not header or not header.startswith("Basic "):
+            return ""
+        try:
+            return base64.b64decode(header[6:]).decode("utf-8").split(":", 1)[0]
+        except Exception:  # noqa
+            return ""
+
+    def _handle_action(self, action, body):
         p = self.cfg_path
         if action == "test_webhook":
             import alerts as _al
@@ -477,11 +544,14 @@ class SettingsServer:
         if action == "save":
             changed = config_tools.update_settings(p, body.get("settings") or {}, self._validate)
             restart = [k for k in changed if k in self.m.RESTART_KEYS or k.startswith("web_")]
+            desk = [k for k in changed if k.startswith("desktop_")]
             msg = "已保存：%s。" % ("、".join(changed) if changed else "没有改动")
             if restart:
                 msg += " 以下项需要重启服务才会生效：%s。" % "、".join(restart)
-            elif changed:
+            elif changed and len(desk) < len(changed):
                 msg += " 将在下一轮扫描内自动生效。"
+            if desk:
+                msg += " 桌面窗口设置（%s）在窗口下次刷新设置时生效。" % "、".join(desk)
             return msg
         if action == "add_user":
             name, pw = (body.get("name") or "").strip(), body.get("password") or ""
@@ -537,7 +607,7 @@ class SettingsServer:
                     return
                 path = self.path.split("?", 1)[0]
                 if path == "/":
-                    return self._send(200, PAGE.replace("__TOKEN__", srv.token), "text/html; charset=utf-8")
+                    return self._send(200, srv.page(), "text/html; charset=utf-8")
                 if path == "/api/state":
                     st = srv.state()
                     st["https"] = srv.https
@@ -580,7 +650,8 @@ class SettingsServer:
                 try:
                     body = json.loads(self.rfile.read(n).decode("utf-8"))
                     action = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
-                    msg = srv.handle_action(action, body if isinstance(body, dict) else {})
+                    actor = "web:" + (srv.auth_user(self.headers.get("Authorization")) or "本机")
+                    msg = srv.handle_action(action, body if isinstance(body, dict) else {}, actor=actor)
                     if isinstance(msg, dict):                       # 连接测试：直接返回结果，不刷新配置
                         return self._json(200, {"ok": True, "msg": msg.get("summary", ""), "test": msg})
                     if srv.log:
@@ -684,7 +755,8 @@ ul{padding-left:0;list-style:none;margin:0}li{padding:4px 0}
 .inline{display:flex;gap:8px}.inline input{flex:1}
 details summary{cursor:pointer;color:#1f4e79;margin-bottom:10px}
 </style></head><body>
-<header>色谱提取 OPC UA 服务 <small style="opacity:.75;font-size:13px;margin-left:8px">运行状态 · 告警 · 诊断 · 设置</small></header><main>
+<header>色谱提取 OPC UA 服务 <small style="opacity:.75;font-size:13px;margin-left:8px">运行状态 · 告警 · 诊断 · 设置</small>
+<select id="langsel" onchange="setLang(this.value)" title="界面语言" style="float:right;font-size:13px"><option value="zh">中文</option><option value="en">English</option></select></header><main>
 <div id="msg"></div>
 <nav id="tabs"><a href="#status" data-t="status">运行状态<span class="dot" id="dot_status"></span></a><a href="#alerts" data-t="alerts">告警与通知<span class="dot" id="dot_alerts"></span></a><a href="#tools" data-t="tools">诊断工具<span class="dot" id="dot_tools"></span></a><a href="#system" data-t="system">系统设置<span class="dot" id="dot_system"></span></a></nav>
 <div class="tab" id="tab_status"><section><h2>运行告警 <small id="al_sum" style="font-weight:normal;color:#666"></small></h2>
@@ -740,9 +812,9 @@ details summary{cursor:pointer;color:#1f4e79;margin-bottom:10px}
 <small style="color:#777">先点下面的“保存设置”，再测试</small></div></div>
 </section></div>
 <div class="tab" id="tab_tools"><section><h2>驱动与软件环境检测</h2>
-<p style="color:#777;font-size:13px;margin-top:0">只读检查，不会安装或修改任何东西：串口设备和驱动（CH340 / FTDI / CP210x / PL2303 等，含黄色感叹号设备）、运行库、防火墙服务、开机自启任务、OPC UA 端口、数据目录。现场装好后、或串口突然不能用时先跑一遍。</p>
+<p style="color:#777;font-size:13px;margin-top:0">只读检查，不会安装或修改任何东西：串口设备和驱动（CH340 / FTDI / CP210x / PL2303 等，含黄色感叹号设备）、运行库、防火墙服务、OPC UA 端口、数据目录、旧版本遗留的后台自启。现场装好后、或串口突然不能用时先跑一遍。</p>
 <div class="row"><label>服务启动时自动检测<span class="tag">需重启</span></label><input type="checkbox" id="env_check_on_start">
-<small>启动后约 8 秒在后台检测；“问题”级别的项会告警（警告级），复查时消失自动恢复；“注意”只记日志</small></div>
+<small>服务启动后约 8 秒自动检测；“问题”级别的项会告警（警告级），复查时消失自动恢复；“注意”只记日志</small></div>
 <div class="row"><label>定期复查（小时）</label><input type="number" id="env_check_hours" min="0" max="168" style="max-width:100px"><small>0 = 只在启动时检查；改完点页面底部“保存设置”</small></div>
 <p id="env_last" style="font-size:13px;color:#555;margin:4px 0 8px"></p>
 <button onclick="dcRun()" id="dc_btn">开始检测</button> <small id="dc_time" style="color:#777"></small>
@@ -762,7 +834,7 @@ details summary{cursor:pointer;color:#1f4e79;margin-bottom:10px}
 <button class="sec" onclick="prAdd()">加为设备检测</button><input type="hidden" id="pr_edit"></div>
 <div id="nt_out" style="margin-top:10px;display:none;border-radius:6px;padding:10px 12px;font-size:13px"></div>
 <div id="st_box" style="margin-top:14px;border-top:1px dashed #ddd;padding-top:12px">
-<b>长时间稳定性测试</b> <small style="color:#777">用上面同样的参数反复测试，统计丢包率、延迟和错误。支持 Ping / TCP 端口 / DNS / OPC UA / Modbus TCP / Modbus RTU / 串口收发；关掉页面也会在后台继续。</small>
+<b>长时间稳定性测试</b> <small style="color:#777">用上面同样的参数反复测试，统计丢包率、延迟和错误。支持 Ping / TCP 端口 / DNS / OPC UA / Modbus TCP / Modbus RTU / 串口收发；关掉网页不影响，关闭桌面主窗口会停止测试。</small>
 <div class="inline" style="margin-top:8px;align-items:center">间隔(秒)<input type="number" id="st_iv" value="1" min="0.2" step="0.1" style="max-width:90px">
 时长<select id="st_min" style="max-width:130px"><option value="10">10 分钟</option><option value="60">1 小时</option><option value="480">8 小时</option><option value="1440">24 小时</option><option value="4320">72 小时</option></select>
 <button onclick="stStart()">开始稳定性测试</button><button class="danger" onclick="post('stab_stop',{}).then(stPoll)">停止</button></div>
@@ -831,7 +903,29 @@ const F={str:["endpoint","server_name","security","csv_export_dir","web_host","w
  bool:["allow_anonymous","allow_insecure_fallback","remote_export","web_ui","env_check_on_start"]};
 let orig={};
 const $=id=>document.getElementById(id);
-const LS={get(k){try{return LS.get(k)}catch(e){return null}},set(k,v){try{LS.set(k,v)}catch(e){}}};
+const LS={get(k){try{return localStorage.getItem(k)}catch(e){return null}},set(k,v){try{localStorage.setItem(k,v)}catch(e){}}};
+/* v3.1 中英文切换：与桌面窗口同一份字典（i18n.EN，以中文原文为键）。只翻译界面文字，日志与节点名不翻译 */
+const I18N=__I18N__;
+let LANG=LS.get("lang")||"__LANG__";
+if(LANG!=="zh"&&LANG!=="en")LANG=(navigator.language||"zh").toLowerCase().startsWith("zh")?"zh":"en";
+const ORIGT=new WeakMap();let I18N_BUSY=false;const TITLE_ZH=document.title;
+function T(s){if(LANG!=="en"||typeof s!=="string")return s;const k=s.replace(/\s+/g," ").trim();const v=I18N[k];
+ if(!v)return s;return s.match(/^\s*/)[0]+v+s.match(/\s*$/)[0]}
+function trNode(n){if(!n)return;
+ if(n.nodeType===3){const p=n.parentNode;if(p&&(p.nodeName==="SCRIPT"||p.nodeName==="STYLE"||p.nodeName==="TEXTAREA"))return;
+  let o=ORIGT.get(n);if(!o||o.shown!==n.nodeValue){o={zh:n.nodeValue,shown:null};ORIGT.set(n,o)}
+  const v=LANG==="en"?T(o.zh):o.zh;o.shown=v;if(n.nodeValue!==v)n.nodeValue=v;return}
+ if(n.nodeType!==1||n.nodeName==="SCRIPT"||n.nodeName==="STYLE")return;
+ for(const a of ["placeholder","title"]){if(!n.hasAttribute(a))continue;
+  if(!n.hasAttribute("data-zh-"+a)||n.getAttribute(a)!==n.getAttribute("data-shown-"+a))n.setAttribute("data-zh-"+a,n.getAttribute(a));
+  const v=LANG==="en"?T(n.getAttribute("data-zh-"+a)):n.getAttribute("data-zh-"+a);n.setAttribute("data-shown-"+a,v);n.setAttribute(a,v)}
+ for(const c of Array.from(n.childNodes))trNode(c)}
+function applyLang(){I18N_BUSY=true;try{trNode(document.body);document.documentElement.lang=LANG==="en"?"en":"zh-CN";
+ document.title=LANG==="en"?T(TITLE_ZH):TITLE_ZH;const s=$("langsel");if(s)s.value=LANG}finally{I18N_BUSY=false}}
+function setLang(v){LANG=v==="en"?"en":"zh";LS.set("lang",LANG);applyLang()}
+new MutationObserver(ms=>{if(I18N_BUSY)return;I18N_BUSY=true;try{for(const m of ms){if(m.type==="characterData")trNode(m.target);else m.addedNodes.forEach(trNode)}}finally{I18N_BUSY=false}})
+ .observe(document.body,{subtree:true,childList:true,characterData:true});
+const _confirm0=window.confirm.bind(window);window.confirm=m=>_confirm0(T(m));
 let msgTimer=null;
 function show(ok,t){const m=$("msg");m.className=ok?"ok":"err";m.textContent=t;clearTimeout(msgTimer);
  if(ok)msgTimer=setTimeout(()=>{m.className=""},6000);
@@ -921,7 +1015,7 @@ function ntParams(){const c=NT[ntKind],fs=c.f==="S"?SER.concat(c.x):c.f,p={};
   if(f[3]!=="password")LS.set("nt_"+f[0],String(p[f[0]]));});return p}
 async function apiPost(path,body){let r;
  try{r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Token":TOKEN},body:JSON.stringify(body)})}
- catch(e){return {ok:false,msg:"连接不到服务：服务可能已停止或正在重启。请确认服务在运行（ChromExtractOPC.exe --status），然后刷新页面。"}}
+ catch(e){return {ok:false,msg:"连接不到服务：服务可能已停止或正在重启。请确认桌面窗口仍然打开、服务在运行（窗口顶部显示“服务运行中”），然后刷新页面。"}}
  if(r.status===401)return {ok:false,msg:"需要重新登录：请刷新页面。"};
  if(r.status===403)return {ok:false,msg:"页面已过期（服务重启过）：请刷新页面后重试。"};
  try{return await r.json()}catch(e){return {ok:false,msg:"服务返回了无法识别的内容（HTTP "+r.status+"），请刷新页面后重试。"}}}
@@ -1090,6 +1184,7 @@ async function harden(){const b=pw();if(!b)return;
  if(!confirm("一键加固会开启加密、关闭匿名访问。现有 DCS/OPC 客户端需要同步改成加密+账号登录，否则会连不上。继续吗？"))return;
  if(await post("harden",b)){$("u_pw").value=$("u_pw2").value=""}}
 initDays();
+applyLang();
 tab(location.hash.slice(1)||LS.get("tab")||"status");
 ntShow("ping");
 mtShow();

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """桌面窗口（desktop_ui）逻辑层测试：表单拼装、保存往返、坏值拒绝、离线状态拼装。
+（v2.9 新增的服务控制、数据目录、导出 CSV 等见 test_desktop_app.py）
 
 不依赖真窗口；窗口冒烟测试只在有显示（或 xvfb）时跑，没有就跳过。
 """
@@ -16,6 +17,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import config_tools as ct        # noqa: E402
+import desktop_features as df    # noqa: E402
 import desktop_ui as du          # noqa: E402
 import server_app as sa          # noqa: E402
 
@@ -190,11 +192,11 @@ class EntryPoints(unittest.TestCase):
         self.assertIn("--desktop", text)
         self.assertIn("--settings", text)
 
-    def test_version_is_28(self):
+    def test_version_is_31(self):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf), self.assertRaises(SystemExit):
             sa.main(["--version"])
-        self.assertIn("2.8", buf.getvalue())
+        self.assertIn("3.1", buf.getvalue())
 
     def test_help_lists_modbus_tools(self):
         buf = io.StringIO()
@@ -211,8 +213,8 @@ class WindowSmoke(unittest.TestCase):
         try:
             cfg_path = os.path.join(tmp, "config.json")
             with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump({"poll_seconds": 30}, f)
-            cfg = sa.load_config(None)
+                json.dump({"poll_seconds": 30, "desktop_language": "zh"}, f)
+            cfg = sa.load_config(cfg_path)
             cfg["_cfg_path"], cfg["_base_dir"] = cfg_path, tmp
             sa.normalize_config(cfg, tmp)
             try:
@@ -222,7 +224,33 @@ class WindowSmoke(unittest.TestCase):
             win.root.update_idletasks()
             win.root.update()
             tabs = [win.nb.tab(i, "text") for i in range(win.nb.index("end"))]
-            self.assertEqual(tabs, ["运行状态", "告警与通知", "诊断工具", "系统设置"])
+            self.assertEqual(tabs, ["运行状态", "通道数据", "谱图预览", "历史对比", "客户端连接", "数据与导出", "运行报表",
+                                    "告警与通知", "诊断工具", "通讯诊断", "Modbus 转发", "常用设置", "系统设置",
+                                    "备份与审计"])
+            # v3.1：峰表、历史对比、Modbus 转发、运行报表、备份与审计、登录栏
+            for attr in ("pk_tree", "hs_tree", "hs_canvas", "mb_tree", "rp_out", "bk_preview", "au_tree", "ur_tree",
+                         "user_var", "btn_login", "lang_combo"):
+                self.assertTrue(hasattr(win, attr), attr)
+            self.assertFalse(win.session.can("config"))      # 没登录 = 操作员只读
+            win._set_language("en")
+            self.assertEqual(win.nb.tab(0, "text"), "Service status")
+            self.assertEqual(win.btn_start.cget("text"), "▶ Start service")
+            win._set_language("zh")
+            self.assertEqual(win.nb.tab(0, "text"), "运行状态")
+            # v3.0 通讯诊断：IP 扫描、端口扫描、串口诊断，各有进度条
+            for attr in ("ip_tree", "ps_tree", "sp_tree", "sp_out", "sp_iface", "sp_rts"):
+                self.assertTrue(hasattr(win, attr), attr)
+            self.assertEqual(set(win.cs_prog), {"ip", "ps", "serial"})
+            # v3.0：通道表、谱图画布、客户端列表、常用设置表单、登录后自动打开窗口
+            for attr in ("chd_tree", "pv_canvas", "pv_combo", "pv_series", "cl_tree", "cl_sum", "qs_msg",
+                         "login_var", "tab_preview"):
+                self.assertTrue(hasattr(win, attr), attr)
+            self.assertEqual(set(win._qvars), {f[0] for f in df.ALL_QUICK_FIELDS})
+            # v2.9：窗口里可启停服务、选数据目录、查看数据源、导出 CSV、自检、开网页
+            for attr in ("btn_start", "btn_stop", "btn_restart", "btn_selftest", "data_dirs_var",
+                         "src_out", "exp_btn", "exp_dir", "exp_last", "box"):
+                self.assertTrue(hasattr(win, attr), attr)
+            self.assertFalse(win.svc.running())          # --settings：不自动启动服务
             # v2.8：诊断工具页有 Modbus Poll / Slave 两个区域
             for attr in ("mbp_out", "mbp_poll_btn", "mbs_log", "mbs_area_out", "mbs_btn"):
                 self.assertTrue(hasattr(win, attr), attr)

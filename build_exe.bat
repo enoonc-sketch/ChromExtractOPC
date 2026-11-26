@@ -29,7 +29,7 @@ if exist build_env\Scripts\python.exe (
   if errorlevel 1 goto :fail
 )
 
-echo [2/4] 安装依赖 asyncua / cryptography / pyinstaller ...
+echo [2/4] 安装依赖 asyncua / cryptography / pyserial / pyinstaller ...
 build_env\Scripts\python -m pip install --disable-pip-version-check --upgrade pip -q
 if errorlevel 1 goto :fail
 build_env\Scripts\python -m pip install --disable-pip-version-check -r requirements.txt -q
@@ -38,9 +38,12 @@ if errorlevel 1 goto :fail
 echo      运行测试 ...
 build_env\Scripts\python -m unittest discover -s tests
 if errorlevel 1 goto :fail
-echo [3/4] 使用 PyInstaller 打包（首次约需 1 到 3 分钟）...
+echo [3/4] 使用 PyInstaller 打包两个 EXE（首次约需 3 到 6 分钟）...
+echo      ChromExtractOPC.exe     = 桌面软件（窗口版，双击打开主窗口，没有黑色控制台）
+echo      ChromExtractOPC-cli.exe = 命令行版（自检、导出、安全管理菜单等脚本工具用）
 if exist dist\ChromExtractOPC.exe del /q dist\ChromExtractOPC.exe
-build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --console --noupx ^
+if exist dist\ChromExtractOPC-cli.exe del /q dist\ChromExtractOPC-cli.exe
+build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx ^
   --name ChromExtractOPC ^
   --icon assets\app.ico ^
   --add-data "assets\app.ico;assets" ^
@@ -49,6 +52,15 @@ build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --console 
   --hidden-import demo_data ^
   --hidden-import web_settings ^
   --hidden-import desktop_ui ^
+  --hidden-import desktop_features ^
+  --hidden-import commscan ^
+  --hidden-import i18n ^
+  --hidden-import backup_tools ^
+  --hidden-import history ^
+  --hidden-import peaks ^
+  --hidden-import modbus_server ^
+  --hidden-import reports ^
+  --hidden-import audit ^
   --hidden-import config_tools ^
   --hidden-import alerts ^
   --hidden-import nettest ^
@@ -57,12 +69,42 @@ build_env\Scripts\python -m PyInstaller --noconfirm --clean --onefile --console 
   --hidden-import probes ^
   --hidden-import drivercheck ^
   --hidden-import envwatch ^
-  --hidden-import bgrun ^
-  --hidden-import winservice ^
+  --hidden-import instance_lock ^
+  --collect-submodules serial ^
+  server_app.py
+if errorlevel 1 goto :fail
+build_env\Scripts\python -m PyInstaller --noconfirm --onefile --console --noupx ^
+  --name ChromExtractOPC-cli ^
+  --icon assets\app.ico ^
+  --add-data "assets\app.ico;assets" ^
+  --collect-all asyncua ^
+  --hidden-import tkinter ^
+  --hidden-import demo_data ^
+  --hidden-import web_settings ^
+  --hidden-import desktop_ui ^
+  --hidden-import desktop_features ^
+  --hidden-import commscan ^
+  --hidden-import i18n ^
+  --hidden-import backup_tools ^
+  --hidden-import history ^
+  --hidden-import peaks ^
+  --hidden-import modbus_server ^
+  --hidden-import reports ^
+  --hidden-import audit ^
+  --hidden-import config_tools ^
+  --hidden-import alerts ^
+  --hidden-import nettest ^
+  --hidden-import modbus_tools ^
+  --hidden-import stability ^
+  --hidden-import probes ^
+  --hidden-import drivercheck ^
+  --hidden-import envwatch ^
+  --hidden-import instance_lock ^
   --collect-submodules serial ^
   server_app.py
 if errorlevel 1 goto :fail
 if not exist dist\ChromExtractOPC.exe goto :fail
+if not exist dist\ChromExtractOPC-cli.exe goto :fail
 
 rem ---- 代码签名（可选）：配置了 SIGN_THUMBPRINT 或 SIGN_PFX 才签，否则跳过 ----
 powershell -NoProfile -ExecutionPolicy Bypass -File sign.ps1 -Check
@@ -70,28 +112,32 @@ if not errorlevel 2 (
   echo      代码签名 ...
   powershell -NoProfile -ExecutionPolicy Bypass -File sign.ps1 dist\ChromExtractOPC.exe
   if errorlevel 1 goto :fail
+  powershell -NoProfile -ExecutionPolicy Bypass -File sign.ps1 dist\ChromExtractOPC-cli.exe
+  if errorlevel 1 goto :fail
 )
 
 echo [4/4] 验证打包结果（自检约需 10 秒）...
-dist\ChromExtractOPC.exe --version
+rem 命令行版有控制台，返回码和输出都能直接看到；窗口版与它是同一份代码，只是没有控制台
+dist\ChromExtractOPC-cli.exe --version
 if errorlevel 1 goto :badexe
-dist\ChromExtractOPC.exe --selftest
+dist\ChromExtractOPC-cli.exe --no-pause --selftest
 if errorlevel 1 goto :badexe
 
 rem ---- 组装发布文件夹：这些文件缺一个，目标电脑上对应功能就用不了 ----
 if not exist dist\config.json copy /y config.json dist\ >nul
-for %%f in ("安装.bat" "卸载.bat" "启动服务.bat" "启动图形界面.bat" "安装开机自启.bat" "install_autostart.ps1" "设置防火墙.bat" "安全管理.bat" "打开设置页面.bat" "后台启动.bat" "停止后台服务.bat" "安装为Windows服务.bat" "卸载Windows服务.bat" "使用说明_OPCUA.md" "安全检查报告.md") do (
+for %%f in ("安装.bat" "卸载.bat" "启动图形界面.bat" "打开设置页面.bat" "设置防火墙.bat" "安全管理.bat" "使用说明_OPCUA.md" "安全检查报告.md" "README.md") do (
   if exist "%%~f" copy /y "%%~f" dist\ >nul
 )
 rem 生成 SHA256 校验值，拷到现场后可核对 EXE 没被篡改或损坏
 powershell -NoProfile -Command "(Get-FileHash dist\ChromExtractOPC.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii dist\ChromExtractOPC.exe.sha256"
+powershell -NoProfile -Command "(Get-FileHash dist\ChromExtractOPC-cli.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii dist\ChromExtractOPC-cli.exe.sha256"
 
 echo.
 echo ============================================
 echo   打包完成，自检通过。
 echo   把整个 dist 文件夹拷到目标电脑，右键
 echo   "安装.bat" 选择"以管理员身份运行"即可。
-echo   （只想试一下：双击 ChromExtractOPC.exe）
+echo   （只想试一下：双击 ChromExtractOPC.exe 打开主窗口）
 echo ============================================
 pause
 exit /b 0

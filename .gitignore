@@ -9,3 +9,7 @@ certs/
 config.json.bak
 *.pfx
 *.p12
+history/
+backups/
+运行报表/
+谱图导出/
